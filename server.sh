@@ -1,11 +1,12 @@
 #!/bin/bash
 # =============================================================
 #  CuraNova — Colab Server Bootstrap
-#  Upload this file to Colab and run:  !bash colab_server.sh
+#  Usage:
+#    git clone https://github.com/Paurakh977/CuraNova.git
+#    cd CuraNova
+#    bash colab_server.sh
 # =============================================================
 
-REPO_URL="https://github.com/Paurakh977/CuraNova.git"
-REPO_DIR="CuraNova"
 PORT=8000
 
 # ─────────────────────────────────────────────
@@ -69,29 +70,11 @@ pip install -q \
 echo "✓ Packages installed"
 
 # ─────────────────────────────────────────────
-# 3. Clone / update repo
+# 3. Write .env
 # ─────────────────────────────────────────────
 echo ""
 echo "────────────────────────────────────────"
-echo " Step 3 — Cloning repository"
-echo "────────────────────────────────────────"
-
-if [ -d "$REPO_DIR/.git" ]; then
-    echo "  Repo already exists — pulling latest …"
-    cd "$REPO_DIR" && git pull
-else
-    git clone "$REPO_URL" "$REPO_DIR"
-    cd "$REPO_DIR"
-fi
-
-echo "✓ Repo ready at $(pwd)"
-
-# ─────────────────────────────────────────────
-# 4. Write .env  (no heredoc — use printf)
-# ─────────────────────────────────────────────
-echo ""
-echo "────────────────────────────────────────"
-echo " Step 4 — Writing .env"
+echo " Step 3 — Writing .env"
 echo "────────────────────────────────────────"
 
 printf "HF_TOKEN=%s\nNGROK_AUTH_TOKEN=%s\nPORT=%s\n" \
@@ -100,12 +83,11 @@ printf "HF_TOKEN=%s\nNGROK_AUTH_TOKEN=%s\nPORT=%s\n" \
 echo "✓ .env written"
 
 # ─────────────────────────────────────────────
-# 5. Write ngrok keeper script via Python
-#    (avoids any heredoc nesting issues)
+# 4. Start ngrok tunnel
 # ─────────────────────────────────────────────
 echo ""
 echo "────────────────────────────────────────"
-echo " Step 5 — Starting ngrok tunnel"
+echo " Step 4 — Starting ngrok tunnel"
 echo "────────────────────────────────────────"
 
 python3 -c "
@@ -150,18 +132,14 @@ script = textwrap.dedent('''
         time.sleep(30)
 ''').lstrip()
 pathlib.Path('/tmp/ngrok_keeper.py').write_text(script)
-print('ngrok keeper script written to /tmp/ngrok_keeper.py')
 "
 
-# Remove stale URL file from a previous run
 rm -f /tmp/ngrok_url.txt
 
-# Launch keeper in background
 python3 /tmp/ngrok_keeper.py &
 NGROK_PID=$!
 echo "  ngrok keeper PID: $NGROK_PID"
 
-# Poll until URL file appears (max 40 s)
 echo "  Waiting for tunnel to establish …"
 TUNNEL_READY=0
 for i in $(seq 1 40); do
@@ -182,11 +160,11 @@ if [ "$TUNNEL_READY" -eq 0 ]; then
 fi
 
 # ─────────────────────────────────────────────
-# 6. Launch FastAPI server (foreground — blocks)
+# 5. Launch FastAPI server (foreground — blocks)
 # ─────────────────────────────────────────────
 echo ""
 echo "────────────────────────────────────────"
-echo " Step 6 — Starting FastAPI / uvicorn"
+echo " Step 5 — Starting FastAPI / uvicorn"
 echo " Ctrl+C stops both server and ngrok"
 echo "────────────────────────────────────────"
 echo ""
