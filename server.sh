@@ -4,10 +4,8 @@
 #  Upload this file to Colab and run:  !bash colab_server.sh
 # =============================================================
 
-set -e  # exit on any error
-
-REPO_URL="https://github.com/Paurakh977/CuraNova.git"   
-REPO_DIR="CuraNova"                                    
+REPO_URL="https://github.com/Paurakh977/CuraNova.git"
+REPO_DIR="CuraNova"
 PORT=8000
 
 # ─────────────────────────────────────────────
@@ -18,8 +16,14 @@ echo "╔═══════════════════════�
 echo "║     CuraNova — Colab Server Setup    ║"
 echo "╚══════════════════════════════════════╝"
 echo ""
-python3 -c "import torch; print(f'GPU available: {torch.cuda.is_available()}'); \
-            print(f'CUDA device:   {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU — consider enabling GPU in Runtime > Change runtime type\"}')" 2>/dev/null || true
+python3 -c "
+import torch
+print(f'GPU available : {torch.cuda.is_available()}')
+if torch.cuda.is_available():
+    print(f'CUDA device   : {torch.cuda.get_device_name(0)}')
+else:
+    print('CUDA device   : CPU — enable GPU via Runtime > Change runtime type')
+" 2>/dev/null || true
 
 # ─────────────────────────────────────────────
 # 1. Collect secrets interactively
@@ -31,13 +35,26 @@ echo "────────────────────────�
 
 read -rsp "  HuggingFace token (hf_...): " HF_TOKEN
 echo ""
+if [ -z "$HF_TOKEN" ]; then
+    echo "✗ HF_TOKEN cannot be empty. Exiting."
+    exit 1
+fi
 
 read -rsp "  Ngrok auth token: " NGROK_AUTH_TOKEN
 echo ""
+if [ -z "$NGROK_AUTH_TOKEN" ]; then
+    echo "✗ NGROK_AUTH_TOKEN cannot be empty. Exiting."
+    exit 1
+fi
 echo ""
 
+# Export so all child processes inherit them
+export HF_TOKEN
+export NGROK_AUTH_TOKEN
+export PORT
+
 # ─────────────────────────────────────────────
-# 2. Install system packages
+# 2. Install packages
 # ─────────────────────────────────────────────
 echo "────────────────────────────────────────"
 echo " Step 2 — Installing packages"
@@ -50,8 +67,8 @@ pip install -q \
     matplotlib \
     requests \
     huggingface_hub \
-    fastapi \
-    uvicorn[standard] \
+    "fastapi>=0.111.0" \
+    "uvicorn[standard]>=0.29.0" \
     python-multipart \
     python-dotenv \
     pyngrok \
@@ -69,12 +86,12 @@ echo "────────────────────────�
 
 if [ -d "$REPO_DIR/.git" ]; then
     echo "  Repo already exists — pulling latest …"
-    cd "$REPO_DIR" && git pull && cd ..
+    cd "$REPO_DIR" && git pull
 else
     git clone "$REPO_URL" "$REPO_DIR"
+    cd "$REPO_DIR"
 fi
 
-cd "$REPO_DIR"
 echo "✓ Repo ready at $(pwd)"
 
 # ─────────────────────────────────────────────
@@ -94,58 +111,105 @@ EOF
 echo "✓ .env written"
 
 # ─────────────────────────────────────────────
-# 5. Start ngrok tunnel in background
+# 5. Start ngrok in background via a persistent
+#    Python process that keeps the tunnel alive
 # ─────────────────────────────────────────────
 echo ""
 echo "────────────────────────────────────────"
 echo " Step 5 — Starting ngrok tunnel"
 echo "────────────────────────────────────────"
 
-python3 - <<PYEOF
+# Write the ngrok keeper to a temp file so it
+# runs as a separate long-lived background process
+cat > /tmp/ngrok_keeper.py << 'PYEOF'
+import os, time, signal, sys
 from pyngrok import ngrok, conf
-import os, time
 
-conf.get_default().auth_token = os.environ.get("NGROK_AUTH_TOKEN", "${NGROK_AUTH_TOKEN}")
+auth_token = os.environ["NGROK_AUTH_TOKEN"]
+port       = int(os.environ.get("PORT", 8000))
 
-# kill any existing tunnels
-ngrok.kill()
+conf.get_default().auth_token = auth_token
+ngrok.kill()   # clean up any stale tunnel from a previous run
 time.sleep(1)
 
-tunnel = ngrok.connect(${PORT}, "http")
+tunnel     = ngrok.connect(port, "http")
 public_url = tunnel.public_url
 
-print(f"""
-╔══════════════════════════════════════════════════════╗
-║  ✓ ngrok tunnel is LIVE                              ║
-║                                                      ║
-║  Public URL : {public_url:<38}║
-║  Health     : {public_url}/health{' '*max(0,32-len('/health'))}║
-║                                                      ║
-║  Use this URL in your VPS backend as COLAB_BASE_URL  ║
-╚══════════════════════════════════════════════════════╝
-""")
+url_line   = public_url
+health_line = public_url + "/health"
+docs_line   = public_url + "/docs"
 
-# Save to file so you can cat it later
+print(f"""
+╔══════════════════════════════════════════════════════════╗
+║  ✓ ngrok tunnel is LIVE                                  ║
+║                                                          ║
+║  Public URL : {url_line:<44}║
+║  Health     : {health_line:<44}║
+║  API Docs   : {docs_line:<44}║
+║                                                          ║
+║  Copy Public URL into your VPS as COLAB_BASE_URL         ║
+╚══════════════════════════════════════════════════════════╝
+""", flush=True)
+
+# Write URL so the shell script can read it back
 with open("/tmp/ngrok_url.txt", "w") as f:
     f.write(public_url)
+
+def _shutdown(sig, frame):
+    print("\nngrok keeper: closing tunnel …")
+    ngrok.kill()
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _shutdown)
+signal.signal(signal.SIGINT,  _shutdown)
+
+# Block forever — keeping the tunnel open
+while True:
+    time.sleep(30)
 PYEOF
 
-export NGROK_AUTH_TOKEN="${NGROK_AUTH_TOKEN}"
+# Launch keeper in background
+python3 /tmp/ngrok_keeper.py &
+NGROK_PID=$!
+echo "  ngrok keeper PID: $NGROK_PID"
+
+# Poll until URL file appears (max 30 s)
+echo "  Waiting for tunnel to establish …"
+TUNNEL_READY=0
+for i in $(seq 1 30); do
+    if [ -f /tmp/ngrok_url.txt ]; then
+        PUBLIC_URL=$(cat /tmp/ngrok_url.txt)
+        echo "✓ Tunnel ready: $PUBLIC_URL"
+        TUNNEL_READY=1
+        break
+    fi
+    sleep 1
+done
+
+if [ "$TUNNEL_READY" -eq 0 ]; then
+    echo "✗ Tunnel failed to start within 30 s."
+    echo "  Check your NGROK_AUTH_TOKEN and try again."
+    kill "$NGROK_PID" 2>/dev/null || true
+    exit 1
+fi
 
 # ─────────────────────────────────────────────
-# 6. Launch FastAPI server (foreground)
+# 6. Launch FastAPI server (foreground — blocks)
 # ─────────────────────────────────────────────
 echo ""
 echo "────────────────────────────────────────"
-echo " Step 6 — Starting FastAPI server"
-echo " Press Ctrl+C to stop"
+echo " Step 6 — Starting FastAPI / uvicorn"
+echo " Ctrl+C stops both the server and ngrok"
 echo "────────────────────────────────────────"
 echo ""
 
-export HF_TOKEN="${HF_TOKEN}"
+# On exit (Ctrl+C or crash) also kill the ngrok keeper
+trap 'echo ""; echo "Shutting down …"; kill "$NGROK_PID" 2>/dev/null || true; exit 0' INT TERM
 
 python3 -m uvicorn server:app \
     --host 0.0.0.0 \
-    --port ${PORT} \
-    --log-level info \
-    --no-access-log
+    --port "$PORT" \
+    --log-level info
+
+# If uvicorn exits by itself, clean up ngrok too
+kill "$NGROK_PID" 2>/dev/null || true
