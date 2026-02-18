@@ -189,6 +189,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "accelerate" },
     { name = "bitsandbytes" },
+    { name = "colorama" },
     { name = "fastapi" },
     { name = "huggingface-hub" },
     { name = "pillow" },
@@ -206,6 +207,7 @@ dependencies = [
 requires-dist = [
     { name = "accelerate", specifier = ">=0.34.0" },
     { name = "bitsandbytes", specifier = ">=0.43.0" },
+    { name = "colorama", specifier = ">=0.4.6" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "huggingface-hub", specifier = ">=0.24.0" },
     { name = "pillow", specifier = ">=10.0.0" },
