@@ -1,6 +1,7 @@
 import os
 import io
 import base64
+import threading
 import requests
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -17,7 +18,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
 # Global model cache — loaded ONCE at startup
+
 MODEL_CACHE: dict = {}
 
 
@@ -52,16 +55,22 @@ def load_model():
     print(f"✓ Model loaded on: {pipe.device}")
 
 
-# Lifespan: load model before first request
+
+# Lifespan — load model in background thread
+# so /health is reachable immediately
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    load_model()
+    thread = threading.Thread(target=load_model, daemon=True)
+    thread.start()
     yield
     MODEL_CACHE.clear()
     print("Model unloaded.")
 
 
+
 # App
+
 app = FastAPI(
     title="CuraNova",
     description="Medical AI Backend powered by MedGemma",
@@ -78,7 +87,9 @@ app.add_middleware(
 )
 
 
+
 # Schemas
+
 class HealthRequest(BaseModel):
     query: str
     patient_id: Optional[str] = None
@@ -100,7 +111,9 @@ class ImageURLRequest(BaseModel):
     max_new_tokens: Optional[int] = 500
 
 
+
 # Utility
+
 def run_inference(image: Optional[Image.Image], prompt: str, max_new_tokens: int = 500) -> str:
     pipe = get_pipeline()
 
@@ -114,7 +127,9 @@ def run_inference(image: Optional[Image.Image], prompt: str, max_new_tokens: int
     return output[0]["generated_text"][-1]["content"]
 
 
+
 # Routes
+
 @app.get("/")
 async def root():
     return {"message": "CuraNova API is running!", "model": "google/medgemma-1.5-4b-it"}
@@ -123,7 +138,11 @@ async def root():
 @app.get("/health")
 async def health_check():
     model_ready = "pipe" in MODEL_CACHE
-    return {"status": "ok", "model_loaded": model_ready}
+    return {
+        "status": "ok",
+        "model_loaded": model_ready,
+        "message": "Model is ready!" if model_ready else "Model is still loading, please wait ...",
+    }
 
 
 @app.post("/analyze", response_model=HealthResponse)
@@ -202,5 +221,6 @@ async def analyze_image_base64(
 
 
 
+# Entry point
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
