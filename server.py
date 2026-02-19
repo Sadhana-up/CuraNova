@@ -132,62 +132,95 @@ def run_inference(image: Optional[Image.Image], prompt: str, max_new_tokens: int
 
 # ── Async streaming inference ─────────────────────────────────
 
+
 async def run_inference_streaming_async(
     image: Optional[Image.Image],
     prompt: str,
     max_new_tokens: int = 500,
 ):
     model, processor = get_artifacts()
-    loop = asyncio.get_event_loop()
-    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    # Queue to bridge the sync streamer thread and the async websocket
+    queue = asyncio.Queue()
 
     inputs = build_inputs(model, processor, image, prompt)
     print(f"[SERVER] 🔢 input_ids shape: {inputs['input_ids'].shape}", flush=True)
 
+    # 1. Create the Streamer
     streamer = TextIteratorStreamer(
         processor.tokenizer,
         skip_prompt=True,
         skip_special_tokens=True,
-        timeout=120.0,
+        timeout=60.0, # Timeout if generation stalls
     )
 
-    token_count = 0
+    generation_kwargs = dict(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        streamer=streamer,
+        do_sample=False,
+    )
 
-    def _generate():
-        nonlocal token_count
+    # 2. Thread A: Run the Model Generation (Producer)
+    # This thread runs the heavy model.generate() which blocks until finished.
+    # It populates the 'streamer' object.
+    def run_generation_thread():
         try:
             print("[SERVER] 🚀 Generation thread started", flush=True)
             with torch.inference_mode():
-                model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    streamer=streamer,
-                    do_sample=False,
-                )
+                model.generate(**generation_kwargs)
         except Exception as exc:
             print(f"[SERVER] ❌ Generation error: {exc}", flush=True)
+            # We can't easily push to queue here, the consumer thread handles exceptions
+            pass 
+        finally:
+            print("[SERVER] 🏁 Generation thread finished", flush=True)
+
+    # 3. Thread B: Consume the Streamer (Bridge)
+    # This thread iterates over the streamer (which blocks waiting for tokens)
+    # and pushes them into the asyncio Queue for the WebSocket.
+    def consume_streamer_thread():
+        try:
+            token_count = 0
+            # This loop blocks waiting for new tokens from Thread A
+            for token in streamer:
+                token_count += 1
+                loop.call_soon_threadsafe(queue.put_nowait, token)
+                
+                # Debug logging for first few tokens
+                if token_count <= 3:
+                    print(f"[SERVER] 📤 Token #{token_count}: {repr(token)}", flush=True)
+            
+            print(f"[SERVER] ✅ Streamer finished. Total tokens: {token_count}", flush=True)
+        except Exception as exc:
+            print(f"[SERVER] ❌ Streamer consumption error: {exc}", flush=True)
             loop.call_soon_threadsafe(queue.put_nowait, exc)
         finally:
-            print(f"[SERVER] ✅ Generation done. Tokens pushed to queue: {token_count}", flush=True)
+            # Signal the async loop that we are done
             loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
 
-    thread = threading.Thread(target=_generate, daemon=True)
-    thread.start()
-    print("[SERVER] 🧵 Generation thread launched", flush=True)
+    # Start the threads
+    t_gen = threading.Thread(target=run_generation_thread, daemon=True)
+    t_gen.start()
+    
+    t_cons = threading.Thread(target=consume_streamer_thread, daemon=True)
+    t_cons.start()
 
+    # 4. Async Main Loop: Yield from Queue to WebSocket
     while True:
+        # Wait for the next token from the queue
         item = await queue.get()
+        
         if item is _SENTINEL:
-            print("[SERVER] 🏁 Sentinel — stream complete", flush=True)
             break
+            
         if isinstance(item, Exception):
+            # If an error occurred inside the threads, re-raise it here
             raise item
-        token_count += 1
-        if token_count <= 5 or token_count % 20 == 0:
-            print(f"[SERVER] 📤 Token #{token_count}: {repr(item)}", flush=True)
+            
         yield item
 
-
+        
 # ── REST Routes ───────────────────────────────────────────────
 
 @app.get("/")
