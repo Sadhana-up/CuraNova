@@ -3,90 +3,114 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CURANOVA // TERMINAL INTERFACE</title>
+    <title>CURANOVA // DIAGNOSTIC TERMINAL</title>
     <link rel="stylesheet" href="style.css">
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;500;700&display=swap" rel="stylesheet">
 </head>
 <body>
-    <div class="scanline"></div>
-    <div class="crt-overlay"></div>
+    
+    <!-- BACKGROUND GRID -->
+    <div class="bg-grid"></div>
+    <div class="vignette"></div>
 
-    <div class="terminal-container">
-        <!-- HEADER STATUS BAR -->
-        <header class="status-bar">
-            <span class="status-item">SYSTEM: <span class="blink">ONLINE</span></span>
-            <span class="status-item">USER: ADMIN</span>
-            <span class="status-item" id="clock">00:00:00</span>
+    <div class="main-interface">
+        
+        <!-- TOP BAR -->
+        <header class="top-bar">
+            <div class="brand">
+                <span class="indicator blink"></span>
+                CURANOVA <span class="version">SYS_V.1.0</span>
+            </div>
+            <div class="meta-data">
+                <span class="meta-item">USER: <span class="highlight">ROOT</span></span>
+                <span class="meta-item">LATENCY: <span class="highlight" id="timeVal">0.0ms</span></span>
+                <span class="meta-item" id="clock">00:00:00</span>
+            </div>
         </header>
 
-        <!-- MAIN TERMINAL OUTPUT AREA -->
-        <div id="terminal-log" class="terminal-log">
-            <div class="log-entry system-msg">> INITIALIZING CURANOVA PROTOCOL V1.0...</div>
-            <div class="log-entry system-msg">> SECURE CONNECTION REQUIRED.</div>
+        <!-- CONTENT GRID -->
+        <div class="content-grid">
             
-            <div class="input-line">
-                <span class="prompt">root@curanova:~$</span>
-                <input type="text" id="ngrokUrl" class="terminal-input" placeholder="ENTER_NGROK_URL" value="https://a161-136-118-65-76.ngrok-free.app">
-            </div>
-            
-            <div class="input-line">
-                <span class="prompt">root@curanova:~$</span>
-                <span class="command-text">SELECT_INPUT_MODE: </span>
-                <div class="mode-toggles">
-                    <button class="terminal-btn active" onclick="setMode('url')">[URL_MODE]</button>
-                    <button class="terminal-btn" onclick="setMode('upload')">[UPLOAD_MODE]</button>
+            <!-- LEFT COLUMN: CONFIG & VISUALS -->
+            <aside class="left-col">
+                
+                <!-- 1. CONNECTION CONFIG -->
+                <div class="panel config-panel">
+                    <div class="panel-head">01 // UPLINK_CONFIG</div>
+                    <div class="input-group">
+                        <label>NGROK_ENDPOINT</label>
+                        <input type="text" id="ngrokUrl" placeholder="https://..." value="https://a161-136-118-65-76.ngrok-free.app">
+                    </div>
                 </div>
-            </div>
 
-            <!-- URL Input -->
-            <div id="url-input-group" class="input-line">
-                <span class="prompt">source@img:~$</span>
-                <input type="text" id="imgUrl" class="terminal-input" 
-                       value="https://upload.wikimedia.org/wikipedia/commons/c/c8/Chest_Xray_PA_3-8-2010.png" 
-                       oninput="updatePreviewFromUrl()" placeholder="ENTER_IMAGE_URL">
-            </div>
+                <!-- 2. VISUAL FEED -->
+                <div class="panel visual-panel">
+                    <div class="panel-head">
+                        02 // VISUAL_TARGET
+                        <div class="toggle-switch">
+                            <button id="btn-url" class="active" onclick="setMode('url')">URL</button>
+                            <button id="btn-up" onclick="setMode('upload')">FILE</button>
+                        </div>
+                    </div>
 
-            <!-- File Input -->
-            <div id="file-input-group" class="input-line hidden">
-                 <span class="prompt">source@file:~$</span>
-                <label for="imgFile" class="file-upload-label">[SELECT_FILE] <span id="fileNameDisplay">NO_FILE_CHOSEN</span></label>
-                <input type="file" id="imgFile" accept="image/*" onchange="updatePreviewFromFile()" style="display:none;">
-            </div>
-            
-            <!-- Image Analysis Prompt -->
-             <div class="input-line">
-                <span class="prompt">query@ai:~$</span>
-                <input type="text" id="prompt" class="terminal-input" value="Describe this chest X-ray. What do you see?" placeholder="ENTER_COMMAND_PROMPT">
-            </div>
+                    <!-- INPUT FIELDS -->
+                    <div class="source-inputs">
+                        <div id="url-input-wrapper">
+                            <input type="text" id="imgUrl" placeholder="IMAGE_SOURCE_URL..." 
+                                   value="https://upload.wikimedia.org/wikipedia/commons/c/c8/Chest_Xray_PA_3-8-2010.png"
+                                   oninput="updatePreviewFromUrl()">
+                        </div>
+                        <div id="file-input-wrapper" class="hidden">
+                            <input type="file" id="imgFile" accept="image/*" onchange="updatePreviewFromFile()" hidden>
+                            <label for="imgFile" class="file-btn">[ UPLOAD_SOURCE_FILE ]</label>
+                            <span id="fileNameDisplay" class="file-name">NO_DATA</span>
+                        </div>
+                    </div>
 
-            <!-- Action Button -->
-            <div class="input-line" style="margin-top: 20px;">
-                <button id="runBtn" class="execute-btn" onclick="runInference()">>> EXECUTE_ANALYSIS <<</button>
-            </div>
+                    <!-- IMAGE PREVIEW BOX -->
+                    <div class="viewport" id="previewContainer">
+                        <div class="crosshair c-tl"></div><div class="crosshair c-tr"></div>
+                        <div class="crosshair c-bl"></div><div class="crosshair c-br"></div>
+                        <div class="scan-overlay"></div>
+                        <img id="preview" src="" alt="">
+                        <div class="placeholder-text">WAITING_FOR_SIGNAL...</div>
+                    </div>
+                </div>
 
-            <!-- Preview Area (Ascii/Scan style) -->
-            <div class="preview-section hidden" id="previewContainer">
-                 <div class="log-entry system-msg">> TARGET_ACQUIRED:</div>
-                 <div class="scan-frame">
-                    <img id="preview" src="" alt="NO SIGNAL">
-                    <div class="scan-overlay"></div>
-                 </div>
-            </div>
+                <!-- 3. CONTROLS -->
+                <div class="panel control-panel">
+                    <div class="panel-head">03 // INFERENCE_QUERY</div>
+                    <textarea id="prompt" rows="2" placeholder="ENTER DIAGNOSTIC QUERY...">Describe this chest X-ray. What do you see?</textarea>
+                    
+                    <button id="runBtn" class="action-btn" onclick="runInference()">
+                        <span class="btn-content">INITIALIZE_ANALYSIS</span>
+                        <div class="btn-glitch"></div>
+                    </button>
+                </div>
 
-            <!-- Real-time Stats -->
-            <div class="stats-row hidden" id="statsRow">
-                <span>> TIME: <b id="timeVal">0.0s</b></span>
-                <span>> TOKENS: <b id="tokenVal">0</b></span>
-                <span>> SPEED: <b id="tpsVal">0 t/s</b></span>
-            </div>
+            </aside>
 
-            <!-- Output Stream -->
-             <div id="output-container" class="output-container hidden">
-                <div class="log-entry system-msg">> INCOMING_TRANSMISSION...</div>
-                <div id="output" class="markdown-body"></div>
-                <div id="cursor" class="typing-cursor">█</div>
-             </div>
+            <!-- RIGHT COLUMN: DATA STREAM -->
+            <main class="right-col">
+                <div class="panel output-panel">
+                    <div class="panel-head">
+                        04 // SYSTEM_LOG
+                        <span class="tps-badge" id="tpsDisplay">SPEED: 0 T/S</span>
+                    </div>
+                    
+                    <div id="terminal-log" class="log-scroll-area">
+                        <div class="log-line system">> SYSTEM INITIALIZED.</div>
+                        <div class="log-line system">> READY FOR INPUT.</div>
+                        
+                        <!-- DYNAMIC OUTPUT -->
+                        <div id="output-container" class="output-stream hidden">
+                             <div id="output" class="markdown-body"></div>
+                             <span class="cursor">█</span>
+                        </div>
+                    </div>
+                </div>
+            </main>
 
         </div>
     </div>
