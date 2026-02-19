@@ -12,42 +12,62 @@ from PIL import Image
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from transformers import pipeline, TextIteratorStreamer
+from transformers import (
+    pipeline,
+    AutoProcessor,
+    AutoModelForImageTextToText,
+    TextIteratorStreamer,
+)
 from huggingface_hub import login
 import uvicorn
 from dotenv import load_dotenv
 
 load_dotenv()
 
+MODEL_ID = "google/medgemma-1.5-4b-it"
 MODEL_CACHE: dict = {}
 _SENTINEL = object()
 
 
-def get_pipeline():
-    if "pipe" not in MODEL_CACHE:
+def get_model_artifacts():
+    if "model" not in MODEL_CACHE:
         raise HTTPException(status_code=503, detail="Model is not loaded yet. Try again in a moment.")
-    return MODEL_CACHE["pipe"]
+    return MODEL_CACHE["model"], MODEL_CACHE["processor"]
 
 
 def load_model():
     hf_token = os.getenv("HF_TOKEN")
     if not hf_token:
         raise RuntimeError("HF_TOKEN environment variable is not set.")
+
     login(token=hf_token)
     print("✓ Logged in to Hugging Face", flush=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"⏳ Loading MedGemma on {device} …", flush=True)
 
-    pipe = pipeline(
-        "image-text-to-text",
-        model="google/medgemma-1.5-4b-it",
+    # Load processor and model separately so we control the streamer wiring
+    processor = AutoProcessor.from_pretrained(MODEL_ID, token=hf_token)
+    model = AutoModelForImageTextToText.from_pretrained(
+        MODEL_ID,
         torch_dtype=torch.bfloat16,
-        device=device,
+        device_map=device,
         token=hf_token,
     )
-    MODEL_CACHE["pipe"] = pipe
-    print(f"✓ Model loaded on: {pipe.device}", flush=True)
+    model.eval()
+
+    MODEL_CACHE["model"] = model
+    MODEL_CACHE["processor"] = processor
+    # Keep a pipeline too for non-streaming REST endpoints
+    MODEL_CACHE["pipe"] = pipeline(
+        "image-text-to-text",
+        model=model,
+        tokenizer=processor.tokenizer,
+        image_processor=processor.image_processor,
+        torch_dtype=torch.bfloat16,
+        device=device,
+    )
+    print(f"✓ Model loaded on: {next(model.parameters()).device}", flush=True)
 
 
 @asynccontextmanager
@@ -90,10 +110,12 @@ class ImageURLRequest(BaseModel):
     max_new_tokens: Optional[int] = 500
 
 
-# ── Non-streaming inference ───────────────────────────────────
+# ── Non-streaming inference (uses pipeline) ───────────────────
 
 def run_inference(image: Optional[Image.Image], prompt: str, max_new_tokens: int = 500) -> str:
-    pipe = get_pipeline()
+    if "pipe" not in MODEL_CACHE:
+        raise HTTPException(status_code=503, detail="Model is not loaded yet.")
+    pipe = MODEL_CACHE["pipe"]
     content = []
     if image:
         content.append({"type": "image", "image": image})
@@ -103,32 +125,55 @@ def run_inference(image: Optional[Image.Image], prompt: str, max_new_tokens: int
     return output[0]["generated_text"][-1]["content"]
 
 
-# ── Async streaming inference ─────────────────────────────────
+# ── Async streaming inference (uses model + processor directly) ─
 
 async def run_inference_streaming_async(
     image: Optional[Image.Image],
     prompt: str,
     max_new_tokens: int = 500,
 ):
-    pipe = get_pipeline()
+    model, processor = get_model_artifacts()
     loop = asyncio.get_event_loop()
     queue: asyncio.Queue = asyncio.Queue()
 
+    # Build messages in the HF chat format
     content = []
     if image:
-        content.append({"type": "image", "image": image})
+        content.append({"type": "image"})   # image placeholder
     content.append({"type": "text", "text": prompt})
     messages = [{"role": "user", "content": content}]
 
-    streamer = TextIteratorStreamer(pipe.tokenizer, skip_prompt=True, skip_special_tokens=True)
-
-    inputs = pipe.tokenizer.apply_chat_template(
+    # Apply chat template via the PROCESSOR (not tokenizer alone)
+    text_input = processor.apply_chat_template(
         messages,
         add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-    ).to(pipe.model.device)
+        tokenize=False,          # get the formatted string first
+    )
+
+    print(f"[SERVER] 📝 Formatted prompt (first 200 chars): {repr(text_input[:200])}", flush=True)
+
+    # Now tokenize with the processor (handles image + text together)
+    if image:
+        inputs = processor(
+            text=text_input,
+            images=image,
+            return_tensors="pt",
+        ).to(model.device)
+    else:
+        inputs = processor(
+            text=text_input,
+            return_tensors="pt",
+        ).to(model.device)
+
+    print(f"[SERVER] 🔢 input_ids shape: {inputs['input_ids'].shape}", flush=True)
+
+    # Wire streamer to processor.tokenizer
+    streamer = TextIteratorStreamer(
+        processor.tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=True,
+        timeout=120.0,
+    )
 
     token_count = 0
 
@@ -136,7 +181,12 @@ async def run_inference_streaming_async(
         nonlocal token_count
         try:
             print("[SERVER] 🚀 Generation thread started", flush=True)
-            pipe.model.generate(**inputs, max_new_tokens=max_new_tokens, streamer=streamer)
+            model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                streamer=streamer,
+                do_sample=False,
+            )
         except Exception as exc:
             print(f"[SERVER] ❌ Generation error: {exc}", flush=True)
             loop.call_soon_threadsafe(queue.put_nowait, exc)
@@ -165,12 +215,12 @@ async def run_inference_streaming_async(
 
 @app.get("/")
 async def root():
-    return {"message": "CuraNova API is running!", "model": "google/medgemma-1.5-4b-it"}
+    return {"message": "CuraNova API is running!", "model": MODEL_ID}
 
 
 @app.get("/health")
 async def health_check():
-    model_ready = "pipe" in MODEL_CACHE
+    model_ready = "model" in MODEL_CACHE
     return {
         "status": "ok",
         "model_loaded": model_ready,
@@ -181,8 +231,7 @@ async def health_check():
 @app.post("/analyze", response_model=HealthResponse)
 async def analyze(data: HealthRequest):
     try:
-        response_text = run_inference(image=None, prompt=data.query)
-        return HealthResponse(response=response_text, status="success")
+        return HealthResponse(response=run_inference(None, data.query), status="success")
     except HTTPException:
         raise
     except Exception as e:
@@ -192,8 +241,7 @@ async def analyze(data: HealthRequest):
 @app.post("/analyze/text", response_model=HealthResponse)
 async def analyze_text(data: TextAnalysisRequest):
     try:
-        response_text = run_inference(image=None, prompt=data.prompt, max_new_tokens=data.max_new_tokens)
-        return HealthResponse(response=response_text, status="success")
+        return HealthResponse(response=run_inference(None, data.prompt, data.max_new_tokens), status="success")
     except HTTPException:
         raise
     except Exception as e:
@@ -206,8 +254,7 @@ async def analyze_image_url(data: ImageURLRequest):
         resp = requests.get(data.image_url, headers={"User-Agent": "CuraNova"}, stream=True, timeout=15)
         resp.raise_for_status()
         image = Image.open(resp.raw).convert("RGB")
-        response_text = run_inference(image=image, prompt=data.prompt, max_new_tokens=data.max_new_tokens)
-        return HealthResponse(response=response_text, status="success")
+        return HealthResponse(response=run_inference(image, data.prompt, data.max_new_tokens), status="success")
     except HTTPException:
         raise
     except Exception as e:
@@ -221,10 +268,8 @@ async def analyze_image_upload(
     max_new_tokens: int = Form(default=500),
 ):
     try:
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
-        response_text = run_inference(image=image, prompt=prompt, max_new_tokens=max_new_tokens)
-        return HealthResponse(response=response_text, status="success")
+        image = Image.open(io.BytesIO(await file.read())).convert("RGB")
+        return HealthResponse(response=run_inference(image, prompt, max_new_tokens), status="success")
     except HTTPException:
         raise
     except Exception as e:
@@ -238,10 +283,8 @@ async def analyze_image_base64(
     max_new_tokens: int = Form(default=500),
 ):
     try:
-        image_bytes = base64.b64decode(image_b64)
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        response_text = run_inference(image=image, prompt=prompt, max_new_tokens=max_new_tokens)
-        return HealthResponse(response=response_text, status="success")
+        image = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
+        return HealthResponse(response=run_inference(image, prompt, max_new_tokens), status="success")
     except HTTPException:
         raise
     except Exception as e:
@@ -258,27 +301,26 @@ async def ws_analyze_text(websocket: WebSocket):
         data = await websocket.receive_json()
         prompt = data.get("prompt", "")
         max_new_tokens = int(data.get("max_new_tokens", 500))
-        print(f"[SERVER] 📩 Received prompt: {prompt[:80]!r}", flush=True)
+        print(f"[SERVER] 📩 prompt={prompt[:80]!r}", flush=True)
 
-        if "pipe" not in MODEL_CACHE:
+        if "model" not in MODEL_CACHE:
             await websocket.send_json({"error": "Model is not loaded yet."})
             await websocket.close()
             return
 
         sent = 0
         async for token in run_inference_streaming_async(None, prompt, max_new_tokens):
-            # Send as a JSON object with a "token" key — no ambiguity
             await websocket.send_json({"token": token})
             sent += 1
             await asyncio.sleep(0)
 
-        print(f"[SERVER] ✅ Stream done. Sent {sent} token messages.", flush=True)
+        print(f"[SERVER] ✅ Sent {sent} token messages.", flush=True)
         await websocket.send_json({"status": "done"})
 
     except WebSocketDisconnect:
-        print("[SERVER] ⚠️  Client disconnected from /ws/analyze/text", flush=True)
+        print("[SERVER] ⚠️  Client disconnected /ws/text", flush=True)
     except Exception as e:
-        print(f"[SERVER] ❌ Error: {e}", flush=True)
+        print(f"[SERVER] ❌ {e}", flush=True)
         try:
             await websocket.send_json({"error": str(e)})
         except Exception:
@@ -294,9 +336,9 @@ async def ws_analyze_image_url(websocket: WebSocket):
         image_url = data.get("image_url", "")
         prompt = data.get("prompt", "Describe this medical image. What do you see?")
         max_new_tokens = int(data.get("max_new_tokens", 500))
-        print(f"[SERVER] 📩 image_url={image_url!r} prompt={prompt[:60]!r}", flush=True)
+        print(f"[SERVER] 📩 url={image_url!r}", flush=True)
 
-        if "pipe" not in MODEL_CACHE:
+        if "model" not in MODEL_CACHE:
             await websocket.send_json({"error": "Model is not loaded yet."})
             await websocket.close()
             return
@@ -304,7 +346,7 @@ async def ws_analyze_image_url(websocket: WebSocket):
         resp = requests.get(image_url, headers={"User-Agent": "CuraNova"}, stream=True, timeout=15)
         resp.raise_for_status()
         image = Image.open(resp.raw).convert("RGB")
-        print(f"[SERVER] 🖼️  Image fetched: {image.size}", flush=True)
+        print(f"[SERVER] 🖼️  Image: {image.size}", flush=True)
 
         sent = 0
         async for token in run_inference_streaming_async(image, prompt, max_new_tokens):
@@ -312,13 +354,13 @@ async def ws_analyze_image_url(websocket: WebSocket):
             sent += 1
             await asyncio.sleep(0)
 
-        print(f"[SERVER] ✅ Stream done. Sent {sent} token messages.", flush=True)
+        print(f"[SERVER] ✅ Sent {sent} token messages.", flush=True)
         await websocket.send_json({"status": "done"})
 
     except WebSocketDisconnect:
-        print("[SERVER] ⚠️  Client disconnected from /ws/analyze/image-url", flush=True)
+        print("[SERVER] ⚠️  Client disconnected /ws/image-url", flush=True)
     except Exception as e:
-        print(f"[SERVER] ❌ Error: {e}", flush=True)
+        print(f"[SERVER] ❌ {e}", flush=True)
         try:
             await websocket.send_json({"error": str(e)})
         except Exception:
@@ -334,30 +376,29 @@ async def ws_analyze_image_base64(websocket: WebSocket):
         image_b64 = data.get("image_b64", "")
         prompt = data.get("prompt", "Describe this medical image. What do you see?")
         max_new_tokens = int(data.get("max_new_tokens", 500))
-        print(f"[SERVER] 📩 b64 length={len(image_b64)} prompt={prompt[:60]!r}", flush=True)
+        print(f"[SERVER] 📩 b64 len={len(image_b64)} prompt={prompt[:60]!r}", flush=True)
 
-        if "pipe" not in MODEL_CACHE:
+        if "model" not in MODEL_CACHE:
             await websocket.send_json({"error": "Model is not loaded yet."})
             await websocket.close()
             return
 
-        image_bytes = base64.b64decode(image_b64)
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        print(f"[SERVER] 🖼️  Image decoded: {image.size}", flush=True)
+        image = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
+        print(f"[SERVER] 🖼️  Image: {image.size}", flush=True)
 
         sent = 0
         async for token in run_inference_streaming_async(image, prompt, max_new_tokens):
-            await websocket.send_json({"token": token})  # ← always JSON, never raw text
+            await websocket.send_json({"token": token})
             sent += 1
             await asyncio.sleep(0)
 
-        print(f"[SERVER] ✅ Stream done. Sent {sent} token messages.", flush=True)
+        print(f"[SERVER] ✅ Sent {sent} token messages.", flush=True)
         await websocket.send_json({"status": "done"})
 
     except WebSocketDisconnect:
-        print("[SERVER] ⚠️  Client disconnected from /ws/analyze/image-base64", flush=True)
+        print("[SERVER] ⚠️  Client disconnected /ws/image-base64", flush=True)
     except Exception as e:
-        print(f"[SERVER] ❌ Error: {e}", flush=True)
+        print(f"[SERVER] ❌ {e}", flush=True)
         try:
             await websocket.send_json({"error": str(e)})
         except Exception:
