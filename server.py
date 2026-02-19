@@ -12,12 +12,7 @@ from PIL import Image
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from transformers import (
-    pipeline,
-    AutoProcessor,
-    AutoModelForImageTextToText,
-    TextIteratorStreamer,
-)
+from transformers import AutoProcessor, AutoModelForImageTextToText, TextIteratorStreamer
 from huggingface_hub import login
 import uvicorn
 from dotenv import load_dotenv
@@ -29,7 +24,7 @@ MODEL_CACHE: dict = {}
 _SENTINEL = object()
 
 
-def get_model_artifacts():
+def get_artifacts():
     if "model" not in MODEL_CACHE:
         raise HTTPException(status_code=503, detail="Model is not loaded yet. Try again in a moment.")
     return MODEL_CACHE["model"], MODEL_CACHE["processor"]
@@ -46,11 +41,10 @@ def load_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"⏳ Loading MedGemma on {device} …", flush=True)
 
-    # Load processor and model separately so we control the streamer wiring
     processor = AutoProcessor.from_pretrained(MODEL_ID, token=hf_token)
     model = AutoModelForImageTextToText.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map=device,
         token=hf_token,
     )
@@ -58,15 +52,6 @@ def load_model():
 
     MODEL_CACHE["model"] = model
     MODEL_CACHE["processor"] = processor
-    # Keep a pipeline too for non-streaming REST endpoints
-    MODEL_CACHE["pipe"] = pipeline(
-        "image-text-to-text",
-        model=model,
-        tokenizer=processor.tokenizer,
-        image_processor=processor.image_processor,
-        torch_dtype=torch.bfloat16,
-        device=device,
-    )
     print(f"✓ Model loaded on: {next(model.parameters()).device}", flush=True)
 
 
@@ -110,64 +95,55 @@ class ImageURLRequest(BaseModel):
     max_new_tokens: Optional[int] = 500
 
 
-# ── Non-streaming inference (uses pipeline) ───────────────────
+# ── Shared input builder ──────────────────────────────────────
 
-def run_inference(image: Optional[Image.Image], prompt: str, max_new_tokens: int = 500) -> str:
-    if "pipe" not in MODEL_CACHE:
-        raise HTTPException(status_code=503, detail="Model is not loaded yet.")
-    pipe = MODEL_CACHE["pipe"]
+def build_inputs(model, processor, image: Optional[Image.Image], prompt: str):
     content = []
     if image:
-        content.append({"type": "image", "image": image})
+        content.append({"type": "image"})
     content.append({"type": "text", "text": prompt})
     messages = [{"role": "user", "content": content}]
-    output = pipe(text=messages, max_new_tokens=max_new_tokens)
-    return output[0]["generated_text"][-1]["content"]
+
+    text_input = processor.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=False
+    )
+    if image:
+        inputs = processor(text=text_input, images=image, return_tensors="pt")
+    else:
+        inputs = processor(text=text_input, return_tensors="pt")
+
+    return inputs.to(model.device)
 
 
-# ── Async streaming inference (uses model + processor directly) ─
+# ── Non-streaming inference ───────────────────────────────────
+
+def run_inference(image: Optional[Image.Image], prompt: str, max_new_tokens: int = 500) -> str:
+    model, processor = get_artifacts()
+    inputs = build_inputs(model, processor, image, prompt)
+    input_len = inputs["input_ids"].shape[1]
+
+    with torch.inference_mode():
+        output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+
+    # Decode only the newly generated tokens
+    new_tokens = output_ids[0][input_len:]
+    return processor.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+
+# ── Async streaming inference ─────────────────────────────────
 
 async def run_inference_streaming_async(
     image: Optional[Image.Image],
     prompt: str,
     max_new_tokens: int = 500,
 ):
-    model, processor = get_model_artifacts()
+    model, processor = get_artifacts()
     loop = asyncio.get_event_loop()
     queue: asyncio.Queue = asyncio.Queue()
 
-    # Build messages in the HF chat format
-    content = []
-    if image:
-        content.append({"type": "image"})   # image placeholder
-    content.append({"type": "text", "text": prompt})
-    messages = [{"role": "user", "content": content}]
-
-    # Apply chat template via the PROCESSOR (not tokenizer alone)
-    text_input = processor.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=False,          # get the formatted string first
-    )
-
-    print(f"[SERVER] 📝 Formatted prompt (first 200 chars): {repr(text_input[:200])}", flush=True)
-
-    # Now tokenize with the processor (handles image + text together)
-    if image:
-        inputs = processor(
-            text=text_input,
-            images=image,
-            return_tensors="pt",
-        ).to(model.device)
-    else:
-        inputs = processor(
-            text=text_input,
-            return_tensors="pt",
-        ).to(model.device)
-
+    inputs = build_inputs(model, processor, image, prompt)
     print(f"[SERVER] 🔢 input_ids shape: {inputs['input_ids'].shape}", flush=True)
 
-    # Wire streamer to processor.tokenizer
     streamer = TextIteratorStreamer(
         processor.tokenizer,
         skip_prompt=True,
@@ -181,17 +157,18 @@ async def run_inference_streaming_async(
         nonlocal token_count
         try:
             print("[SERVER] 🚀 Generation thread started", flush=True)
-            model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                streamer=streamer,
-                do_sample=False,
-            )
+            with torch.inference_mode():
+                model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    streamer=streamer,
+                    do_sample=False,
+                )
         except Exception as exc:
             print(f"[SERVER] ❌ Generation error: {exc}", flush=True)
             loop.call_soon_threadsafe(queue.put_nowait, exc)
         finally:
-            print(f"[SERVER] ✅ Generation done. Total tokens pushed: {token_count}", flush=True)
+            print(f"[SERVER] ✅ Generation done. Tokens pushed to queue: {token_count}", flush=True)
             loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
 
     thread = threading.Thread(target=_generate, daemon=True)
@@ -201,7 +178,7 @@ async def run_inference_streaming_async(
     while True:
         item = await queue.get()
         if item is _SENTINEL:
-            print("[SERVER] 🏁 Sentinel received — stream complete", flush=True)
+            print("[SERVER] 🏁 Sentinel — stream complete", flush=True)
             break
         if isinstance(item, Exception):
             raise item
