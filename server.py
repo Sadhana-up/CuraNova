@@ -19,11 +19,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-
-# Global model cache — loaded ONCE at startup
 MODEL_CACHE: dict = {}
-
-_SENTINEL = object()  # signals end of token stream
+_SENTINEL = object()
 
 
 def get_pipeline():
@@ -36,12 +33,11 @@ def load_model():
     hf_token = os.getenv("HF_TOKEN")
     if not hf_token:
         raise RuntimeError("HF_TOKEN environment variable is not set.")
-
     login(token=hf_token)
-    print("✓ Logged in to Hugging Face")
+    print("✓ Logged in to Hugging Face", flush=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"⏳ Loading MedGemma on {device} …")
+    print(f"⏳ Loading MedGemma on {device} …", flush=True)
 
     pipe = pipeline(
         "image-text-to-text",
@@ -50,9 +46,8 @@ def load_model():
         device=device,
         token=hf_token,
     )
-
     MODEL_CACHE["pipe"] = pipe
-    print(f"✓ Model loaded on: {pipe.device}")
+    print(f"✓ Model loaded on: {pipe.device}", flush=True)
 
 
 @asynccontextmanager
@@ -64,12 +59,7 @@ async def lifespan(app: FastAPI):
     print("Model unloaded.")
 
 
-app = FastAPI(
-    title="CuraNova",
-    description="Medical AI Backend powered by MedGemma",
-    version="1.0.0",
-    lifespan=lifespan,
-)
+app = FastAPI(title="CuraNova", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -120,10 +110,6 @@ async def run_inference_streaming_async(
     prompt: str,
     max_new_tokens: int = 500,
 ):
-    """
-    Runs model.generate() in a background thread and yields tokens
-    asynchronously via asyncio.Queue — never blocks the event loop.
-    """
     pipe = get_pipeline()
     loop = asyncio.get_event_loop()
     queue: asyncio.Queue = asyncio.Queue()
@@ -144,25 +130,35 @@ async def run_inference_streaming_async(
         return_tensors="pt",
     ).to(pipe.model.device)
 
+    token_count = 0
+
     def _generate():
-        """Runs in background thread; pushes tokens into asyncio queue."""
+        nonlocal token_count
         try:
+            print("[SERVER] 🚀 Generation thread started", flush=True)
             pipe.model.generate(**inputs, max_new_tokens=max_new_tokens, streamer=streamer)
         except Exception as exc:
+            print(f"[SERVER] ❌ Generation error: {exc}", flush=True)
             loop.call_soon_threadsafe(queue.put_nowait, exc)
         finally:
+            print(f"[SERVER] ✅ Generation done. Total tokens pushed: {token_count}", flush=True)
             loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
 
     thread = threading.Thread(target=_generate, daemon=True)
     thread.start()
+    print("[SERVER] 🧵 Generation thread launched", flush=True)
 
     while True:
         item = await queue.get()
         if item is _SENTINEL:
+            print("[SERVER] 🏁 Sentinel received — stream complete", flush=True)
             break
         if isinstance(item, Exception):
             raise item
-        yield item  # plain token string
+        token_count += 1
+        if token_count <= 5 or token_count % 20 == 0:
+            print(f"[SERVER] 📤 Token #{token_count}: {repr(item)}", flush=True)
+        yield item
 
 
 # ── REST Routes ───────────────────────────────────────────────
@@ -256,30 +252,33 @@ async def analyze_image_base64(
 
 @app.websocket("/ws/analyze/text")
 async def ws_analyze_text(websocket: WebSocket):
-    """
-    Client sends: {"prompt": "...", "max_new_tokens": 500}
-    Server streams tokens, then sends: {"status": "done"}
-    """
     await websocket.accept()
+    print("[SERVER] 🔌 WS /text connected", flush=True)
     try:
         data = await websocket.receive_json()
         prompt = data.get("prompt", "")
         max_new_tokens = int(data.get("max_new_tokens", 500))
+        print(f"[SERVER] 📩 Received prompt: {prompt[:80]!r}", flush=True)
 
         if "pipe" not in MODEL_CACHE:
             await websocket.send_json({"error": "Model is not loaded yet."})
             await websocket.close()
             return
 
+        sent = 0
         async for token in run_inference_streaming_async(None, prompt, max_new_tokens):
-            await websocket.send_text(token)
-            await asyncio.sleep(0)  # yield to event loop → forces immediate flush
+            # Send as a JSON object with a "token" key — no ambiguity
+            await websocket.send_json({"token": token})
+            sent += 1
+            await asyncio.sleep(0)
 
+        print(f"[SERVER] ✅ Stream done. Sent {sent} token messages.", flush=True)
         await websocket.send_json({"status": "done"})
 
     except WebSocketDisconnect:
-        print("Client disconnected from /ws/analyze/text")
+        print("[SERVER] ⚠️  Client disconnected from /ws/analyze/text", flush=True)
     except Exception as e:
+        print(f"[SERVER] ❌ Error: {e}", flush=True)
         try:
             await websocket.send_json({"error": str(e)})
         except Exception:
@@ -288,16 +287,14 @@ async def ws_analyze_text(websocket: WebSocket):
 
 @app.websocket("/ws/analyze/image-url")
 async def ws_analyze_image_url(websocket: WebSocket):
-    """
-    Client sends: {"image_url": "https://...", "prompt": "...", "max_new_tokens": 500}
-    Server streams tokens, then sends: {"status": "done"}
-    """
     await websocket.accept()
+    print("[SERVER] 🔌 WS /image-url connected", flush=True)
     try:
         data = await websocket.receive_json()
         image_url = data.get("image_url", "")
         prompt = data.get("prompt", "Describe this medical image. What do you see?")
         max_new_tokens = int(data.get("max_new_tokens", 500))
+        print(f"[SERVER] 📩 image_url={image_url!r} prompt={prompt[:60]!r}", flush=True)
 
         if "pipe" not in MODEL_CACHE:
             await websocket.send_json({"error": "Model is not loaded yet."})
@@ -307,16 +304,21 @@ async def ws_analyze_image_url(websocket: WebSocket):
         resp = requests.get(image_url, headers={"User-Agent": "CuraNova"}, stream=True, timeout=15)
         resp.raise_for_status()
         image = Image.open(resp.raw).convert("RGB")
+        print(f"[SERVER] 🖼️  Image fetched: {image.size}", flush=True)
 
+        sent = 0
         async for token in run_inference_streaming_async(image, prompt, max_new_tokens):
-            await websocket.send_text(token)
+            await websocket.send_json({"token": token})
+            sent += 1
             await asyncio.sleep(0)
 
+        print(f"[SERVER] ✅ Stream done. Sent {sent} token messages.", flush=True)
         await websocket.send_json({"status": "done"})
 
     except WebSocketDisconnect:
-        print("Client disconnected from /ws/analyze/image-url")
+        print("[SERVER] ⚠️  Client disconnected from /ws/analyze/image-url", flush=True)
     except Exception as e:
+        print(f"[SERVER] ❌ Error: {e}", flush=True)
         try:
             await websocket.send_json({"error": str(e)})
         except Exception:
@@ -325,16 +327,14 @@ async def ws_analyze_image_url(websocket: WebSocket):
 
 @app.websocket("/ws/analyze/image-base64")
 async def ws_analyze_image_base64(websocket: WebSocket):
-    """
-    Client sends: {"image_b64": "<base64>", "prompt": "...", "max_new_tokens": 500}
-    Server streams tokens, then sends: {"status": "done"}
-    """
     await websocket.accept()
+    print("[SERVER] 🔌 WS /image-base64 connected", flush=True)
     try:
         data = await websocket.receive_json()
         image_b64 = data.get("image_b64", "")
         prompt = data.get("prompt", "Describe this medical image. What do you see?")
         max_new_tokens = int(data.get("max_new_tokens", 500))
+        print(f"[SERVER] 📩 b64 length={len(image_b64)} prompt={prompt[:60]!r}", flush=True)
 
         if "pipe" not in MODEL_CACHE:
             await websocket.send_json({"error": "Model is not loaded yet."})
@@ -343,22 +343,26 @@ async def ws_analyze_image_base64(websocket: WebSocket):
 
         image_bytes = base64.b64decode(image_b64)
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        print(f"[SERVER] 🖼️  Image decoded: {image.size}", flush=True)
 
+        sent = 0
         async for token in run_inference_streaming_async(image, prompt, max_new_tokens):
-            await websocket.send_text(token)
-            await asyncio.sleep(0)  # yield → forces immediate network flush
+            await websocket.send_json({"token": token})  # ← always JSON, never raw text
+            sent += 1
+            await asyncio.sleep(0)
 
+        print(f"[SERVER] ✅ Stream done. Sent {sent} token messages.", flush=True)
         await websocket.send_json({"status": "done"})
 
     except WebSocketDisconnect:
-        print("Client disconnected from /ws/analyze/image-base64")
+        print("[SERVER] ⚠️  Client disconnected from /ws/analyze/image-base64", flush=True)
     except Exception as e:
+        print(f"[SERVER] ❌ Error: {e}", flush=True)
         try:
             await websocket.send_json({"error": str(e)})
         except Exception:
             pass
 
 
-# Entry point
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
