@@ -8,10 +8,10 @@ from typing import Optional
 
 import torch
 from PIL import Image
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from transformers import pipeline
+from transformers import pipeline, TextIteratorStreamer
 from huggingface_hub import login
 import uvicorn
 from dotenv import load_dotenv
@@ -127,6 +127,39 @@ def run_inference(image: Optional[Image.Image], prompt: str, max_new_tokens: int
     return output[0]["generated_text"][-1]["content"]
 
 
+def run_inference_streaming(image: Optional[Image.Image], prompt: str, max_new_tokens: int = 500):
+    """
+    Generator that yields tokens one by one using TextIteratorStreamer.
+    """
+    pipe = get_pipeline()
+
+    content = []
+    if image:
+        content.append({"type": "image", "image": image})
+    content.append({"type": "text", "text": prompt})
+
+    messages = [{"role": "user", "content": content}]
+
+    streamer = TextIteratorStreamer(pipe.tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+    inputs = pipe.tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(pipe.model.device)
+
+    generation_kwargs = dict(**inputs, max_new_tokens=max_new_tokens, streamer=streamer)
+    thread = threading.Thread(target=pipe.model.generate, kwargs=generation_kwargs)
+    thread.start()
+
+    for token in streamer:
+        yield token
+
+    thread.join()
+
+
 
 # Routes
 
@@ -219,6 +252,116 @@ async def analyze_image_base64(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ─────────────────────────────────────────────
+#  STREAMING WebSocket Endpoints
+# ─────────────────────────────────────────────
+
+@app.websocket("/ws/analyze/text")
+async def ws_analyze_text(websocket: WebSocket):
+    """
+    WebSocket: stream text-only medical query.
+
+    Client sends JSON:  {"prompt": "...", "max_new_tokens": 500}
+    Server streams back tokens as plain text strings.
+    Final message: {"status": "done"}
+    """
+    await websocket.accept()
+    try:
+        data = await websocket.receive_json()
+        prompt = data.get("prompt", "")
+        max_new_tokens = int(data.get("max_new_tokens", 500))
+
+        if "pipe" not in MODEL_CACHE:
+            await websocket.send_json({"error": "Model is not loaded yet. Try again in a moment."})
+            await websocket.close()
+            return
+
+        for token in run_inference_streaming(image=None, prompt=prompt, max_new_tokens=max_new_tokens):
+            await websocket.send_text(token)
+
+        await websocket.send_json({"status": "done"})
+
+    except WebSocketDisconnect:
+        print("Client disconnected from /ws/analyze/text")
+    except Exception as e:
+        await websocket.send_json({"error": str(e)})
+        await websocket.close()
+
+
+@app.websocket("/ws/analyze/image-url")
+async def ws_analyze_image_url(websocket: WebSocket):
+    """
+    WebSocket: stream analysis of an image supplied as a public URL.
+
+    Client sends JSON:
+        {"image_url": "https://...", "prompt": "...", "max_new_tokens": 500}
+    Server streams back tokens as plain text strings.
+    Final message: {"status": "done"}
+    """
+    await websocket.accept()
+    try:
+        data = await websocket.receive_json()
+        image_url = data.get("image_url", "")
+        prompt = data.get("prompt", "Describe this medical image. What do you see?")
+        max_new_tokens = int(data.get("max_new_tokens", 500))
+
+        if "pipe" not in MODEL_CACHE:
+            await websocket.send_json({"error": "Model is not loaded yet. Try again in a moment."})
+            await websocket.close()
+            return
+
+        resp = requests.get(image_url, headers={"User-Agent": "CuraNova"}, stream=True, timeout=15)
+        resp.raise_for_status()
+        image = Image.open(resp.raw).convert("RGB")
+
+        for token in run_inference_streaming(image=image, prompt=prompt, max_new_tokens=max_new_tokens):
+            await websocket.send_text(token)
+
+        await websocket.send_json({"status": "done"})
+
+    except WebSocketDisconnect:
+        print("Client disconnected from /ws/analyze/image-url")
+    except Exception as e:
+        await websocket.send_json({"error": str(e)})
+        await websocket.close()
+
+
+@app.websocket("/ws/analyze/image-base64")
+async def ws_analyze_image_base64(websocket: WebSocket):
+    """
+    WebSocket: stream analysis of a base64-encoded image.
+
+    Client sends JSON:
+        {"image_b64": "<base64 string>", "prompt": "...", "max_new_tokens": 500}
+    Server streams back tokens as plain text strings.
+    Final message: {"status": "done"}
+    """
+    await websocket.accept()
+    try:
+        data = await websocket.receive_json()
+        image_b64 = data.get("image_b64", "")
+        prompt = data.get("prompt", "Describe this medical image. What do you see?")
+        max_new_tokens = int(data.get("max_new_tokens", 500))
+
+        if "pipe" not in MODEL_CACHE:
+            await websocket.send_json({"error": "Model is not loaded yet. Try again in a moment."})
+            await websocket.close()
+            return
+
+        image_bytes = base64.b64decode(image_b64)
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        for token in run_inference_streaming(image=image, prompt=prompt, max_new_tokens=max_new_tokens):
+            await websocket.send_text(token)
+
+        await websocket.send_json({"status": "done"})
+
+    except WebSocketDisconnect:
+        print("Client disconnected from /ws/analyze/image-base64")
+    except Exception as e:
+        await websocket.send_json({"error": str(e)})
+        await websocket.close()
 
 
 # Entry point

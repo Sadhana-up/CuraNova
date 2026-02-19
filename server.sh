@@ -65,7 +65,9 @@ pip install -q \
     python-multipart \
     python-dotenv \
     pyngrok \
-    accelerate
+    accelerate \
+    websockets \
+    colorama
 
 echo "✓ Packages installed"
 
