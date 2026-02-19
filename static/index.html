@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CURANOVA // TERMINAL INTERFACE</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="scanline"></div>
+    <div class="crt-overlay"></div>
+
+    <div class="terminal-container">
+        <!-- HEADER STATUS BAR -->
+        <header class="status-bar">
+            <span class="status-item">SYSTEM: <span class="blink">ONLINE</span></span>
+            <span class="status-item">USER: ADMIN</span>
+            <span class="status-item" id="clock">00:00:00</span>
+        </header>
+
+        <!-- MAIN TERMINAL OUTPUT AREA -->
+        <div id="terminal-log" class="terminal-log">
+            <div class="log-entry system-msg">> INITIALIZING CURANOVA PROTOCOL V1.0...</div>
+            <div class="log-entry system-msg">> SECURE CONNECTION REQUIRED.</div>
+            
+            <div class="input-line">
+                <span class="prompt">root@curanova:~$</span>
+                <input type="text" id="ngrokUrl" class="terminal-input" placeholder="ENTER_NGROK_URL" value="https://a161-136-118-65-76.ngrok-free.app">
+            </div>
+            
+            <div class="input-line">
+                <span class="prompt">root@curanova:~$</span>
+                <span class="command-text">SELECT_INPUT_MODE: </span>
+                <div class="mode-toggles">
+                    <button class="terminal-btn active" onclick="setMode('url')">[URL_MODE]</button>
+                    <button class="terminal-btn" onclick="setMode('upload')">[UPLOAD_MODE]</button>
+                </div>
+            </div>
+
+            <!-- URL Input -->
+            <div id="url-input-group" class="input-line">
+                <span class="prompt">source@img:~$</span>
+                <input type="text" id="imgUrl" class="terminal-input" 
+                       value="https://upload.wikimedia.org/wikipedia/commons/c/c8/Chest_Xray_PA_3-8-2010.png" 
+                       oninput="updatePreviewFromUrl()" placeholder="ENTER_IMAGE_URL">
+            </div>
+
+            <!-- File Input -->
+            <div id="file-input-group" class="input-line hidden">
+                 <span class="prompt">source@file:~$</span>
+                <label for="imgFile" class="file-upload-label">[SELECT_FILE] <span id="fileNameDisplay">NO_FILE_CHOSEN</span></label>
+                <input type="file" id="imgFile" accept="image/*" onchange="updatePreviewFromFile()" style="display:none;">
+            </div>
+            
+            <!-- Image Analysis Prompt -->
+             <div class="input-line">
+                <span class="prompt">query@ai:~$</span>
+                <input type="text" id="prompt" class="terminal-input" value="Describe this chest X-ray. What do you see?" placeholder="ENTER_COMMAND_PROMPT">
+            </div>
+
+            <!-- Action Button -->
+            <div class="input-line" style="margin-top: 20px;">
+                <button id="runBtn" class="execute-btn" onclick="runInference()">>> EXECUTE_ANALYSIS <<</button>
+            </div>
+
+            <!-- Preview Area (Ascii/Scan style) -->
+            <div class="preview-section hidden" id="previewContainer">
+                 <div class="log-entry system-msg">> TARGET_ACQUIRED:</div>
+                 <div class="scan-frame">
+                    <img id="preview" src="" alt="NO SIGNAL">
+                    <div class="scan-overlay"></div>
+                 </div>
+            </div>
+
+            <!-- Real-time Stats -->
+            <div class="stats-row hidden" id="statsRow">
+                <span>> TIME: <b id="timeVal">0.0s</b></span>
+                <span>> TOKENS: <b id="tokenVal">0</b></span>
+                <span>> SPEED: <b id="tpsVal">0 t/s</b></span>
+            </div>
+
+            <!-- Output Stream -->
+             <div id="output-container" class="output-container hidden">
+                <div class="log-entry system-msg">> INCOMING_TRANSMISSION...</div>
+                <div id="output" class="markdown-body"></div>
+                <div id="cursor" class="typing-cursor">█</div>
+             </div>
+
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
