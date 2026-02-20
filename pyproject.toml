@@ -38,4 +38,5 @@ torchaudio = { index = "pytorch-cu128" }
 [tool.uv.workspace]
 members = [
     "agent_mcp",
+    "agent_server",
 ]
