@@ -34,3 +34,8 @@ url = "https://pypi.org/simple"
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
 torchaudio = { index = "pytorch-cu128" }
+
+[tool.uv.workspace]
+members = [
+    "agent_mcp",
+]
