@@ -48,7 +48,7 @@ search_agent = Agent(
     name="SearchAgent",
     model=os.getenv("DEMO_AGENT_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025"),
     description="An agent that searches the web for information.",
-    instruction="You are a researcher. Use the google_search tool to find information on the web.",
+    instruction="You are a researcher. Use the google_search tool to find information on the web. ALWASYS TRANSFER CONTROL BACK TO THE ORCHESTRATOR AGENT AFTER CALLING THIS TOOL.",
     tools=[google_search, calculate_factorial]
 )
 
@@ -59,7 +59,7 @@ math_agent_tool = agent_tool.AgentTool(agent=math_agent)
 agent = Agent(
     name="OrchestratorAgent",
     model=os.getenv("DEMO_AGENT_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025"),
-    instruction="You are a helpful orchestrator assistant. Use the JokeAgent tool for jokes, use the MathAgent tool for factorials, and transfer to SearchAgent for web searches.",
+    instruction="You are a helpful orchestrator assistant. Use the JokeAgent tool for jokes, use the MathAgent tool for factorials, and transfer to SearchAgent for web searches.ALWAYS TRANFER BACK CONTROL TO YOURSELF AFTER CALLING THE SUB AGENTS",
     tools=[joke_agent_tool, math_agent_tool],
     sub_agents=[search_agent]  
 )
