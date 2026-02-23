@@ -4,9 +4,11 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import warnings
 from pathlib import Path
 
+import websockets
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -62,6 +64,82 @@ runner = Runner(app_name=APP_NAME, agent=agent, session_service=session_service)
 async def root():
     """Serve the index.html page."""
     return FileResponse(Path(__file__).parent / "static" / "index.html")
+
+
+# ========================================
+# Direct Streaming Proxy for Colab Medical AI
+# ========================================
+
+
+@app.websocket("/ws/analyze")
+async def analyze_proxy(websocket: WebSocket) -> None:
+    """WebSocket proxy that streams tokens directly from the Colab medical AI server.
+
+    The client sends a JSON message with {image_url, prompt} and receives
+    a stream of {token: "..."} messages, ending with {status: "done"}.
+    This bypasses the ADK agent entirely for zero-filler direct streaming.
+    """
+    await websocket.accept()
+
+    try:
+        # Receive the analysis request from the client
+        request_data = await websocket.receive_text()
+        request = json.loads(request_data)
+        image_url = request.get("image_url", "")
+        prompt = request.get("prompt", "Describe this medical image in detail.")
+        max_new_tokens = request.get("max_new_tokens", 500)
+
+        logger.info(f"[analyze_proxy] image_url={image_url[:80]}, prompt={prompt[:60]}")
+
+        # Build the Colab WebSocket URL
+        colab_base_url = os.getenv("COLAB_BASE_URL", "")
+        if not colab_base_url:
+            await websocket.send_json({"error": "COLAB_BASE_URL is not configured."})
+            await websocket.close()
+            return
+
+        ws_url = (
+            colab_base_url
+            .replace("https://", "wss://")
+            .replace("http://", "ws://")
+            .rstrip("/")
+        )
+        endpoint = f"{ws_url}/ws/analyze/image-url"
+
+        payload = {
+            "image_url": image_url,
+            "prompt": prompt,
+            "max_new_tokens": max_new_tokens,
+        }
+
+        # Connect to Colab and stream tokens back to the browser
+        async with websockets.connect(endpoint) as colab_ws:
+            await colab_ws.send(json.dumps(payload))
+
+            async for message in colab_ws:
+                data = json.loads(message)
+                if "token" in data:
+                    await websocket.send_json({"token": data["token"]})
+                elif data.get("status") == "done":
+                    await websocket.send_json({"status": "done"})
+                    break
+                elif "error" in data:
+                    await websocket.send_json({"error": data["error"]})
+                    break
+
+    except WebSocketDisconnect:
+        logger.debug("[analyze_proxy] Client disconnected")
+    except Exception as e:
+        logger.error(f"[analyze_proxy] Error: {e}", exc_info=True)
+        try:
+            await websocket.send_json({"error": str(e)})
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 # ========================================

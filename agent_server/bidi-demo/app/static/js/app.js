@@ -71,6 +71,11 @@ let currentOutputTranscriptionId = null;
 let currentOutputTranscriptionElement = null;
 let inputTranscriptionFinished = false; // Track if input transcription is complete for this turn
 
+// ── Direct-streaming state for medical image analysis ──
+let analyzeWs = null;          // dedicated WebSocket for /ws/analyze
+let analyzeStreamBubble = null; // the specially-colored bubble for tool output
+let analyzeStreamText = "";     // accumulated streamed text
+
 // Helper function to clean spaces between CJK characters
 // Removes spaces between Japanese/Chinese/Korean characters while preserving spaces around Latin text
 function cleanCJKSpaces(text) {
@@ -251,6 +256,144 @@ function createImageBubble(imageDataUrl, isUser) {
   messageDiv.appendChild(bubbleDiv);
 
   return messageDiv;
+}
+
+// ── Tool-stream bubble: distinctly-colored bubble for medical analysis output ──
+function createToolStreamBubble() {
+  const messageDiv = document.createElement("div");
+  messageDiv.className = "message agent tool-stream";
+
+  const bubbleDiv = document.createElement("div");
+  bubbleDiv.className = "bubble";
+
+  const label = document.createElement("span");
+  label.className = "tool-stream-label";
+  label.textContent = "🩺 Medical Analysis";
+
+  const textP = document.createElement("p");
+  textP.className = "bubble-text";
+  textP.textContent = "";
+
+  const typingSpan = document.createElement("span");
+  typingSpan.className = "typing-indicator";
+  textP.appendChild(typingSpan);
+
+  bubbleDiv.appendChild(label);
+  bubbleDiv.appendChild(textP);
+  messageDiv.appendChild(bubbleDiv);
+  return messageDiv;
+}
+
+// ── Detect image URL in a message string ──
+function extractImageUrl(text) {
+  // Match common image URL patterns (http/https ending in common image exts, or known hosts)
+  const urlRegex = /(https?:\/\/[^\s]+\.(?:png|jpg|jpeg|gif|bmp|webp|tif|tiff|svg))/i;
+  const match = text.match(urlRegex);
+  if (match) return match[1];
+
+  // Also match any https URL (user may paste a URL without extension)
+  const genericUrl = /(https?:\/\/[^\s]+)/i;
+  const gMatch = text.match(genericUrl);
+  if (gMatch) return gMatch[1];
+
+  return null;
+}
+
+// ── Start a direct-streaming analysis via /ws/analyze ──
+function startDirectAnalysis(imageUrl, prompt) {
+  const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const analyzeUrl = wsProtocol + "//" + window.location.host + "/ws/analyze";
+
+  // Show system message
+  addSystemMessage("Routing request to Colab medical model...");
+
+  // Create the colored tool-stream bubble
+  analyzeStreamText = "";
+  analyzeStreamBubble = createToolStreamBubble();
+  messagesDiv.appendChild(analyzeStreamBubble);
+  scrollToBottom();
+
+  addConsoleEntry('outgoing', 'Direct Analysis Request', {
+    image_url: imageUrl,
+    prompt: prompt,
+    endpoint: analyzeUrl
+  }, '🩺', 'system');
+
+  analyzeWs = new WebSocket(analyzeUrl);
+
+  analyzeWs.onopen = function () {
+    // Send the request payload
+    analyzeWs.send(JSON.stringify({
+      image_url: imageUrl,
+      prompt: prompt,
+      max_new_tokens: 500
+    }));
+  };
+
+  analyzeWs.onmessage = function (event) {
+    const data = JSON.parse(event.data);
+
+    if (data.token) {
+      analyzeStreamText += data.token;
+      // Update the bubble text in real-time
+      const textEl = analyzeStreamBubble.querySelector(".bubble-text");
+
+      // Remove existing typing indicator
+      const existingIndicator = textEl.querySelector(".typing-indicator");
+      if (existingIndicator) existingIndicator.remove();
+
+      textEl.textContent = analyzeStreamText;
+
+      // Re-add typing indicator
+      const typingSpan = document.createElement("span");
+      typingSpan.className = "typing-indicator";
+      textEl.appendChild(typingSpan);
+
+      scrollToBottom();
+    } else if (data.status === "done") {
+      // Finalize: remove typing indicator
+      const textEl = analyzeStreamBubble.querySelector(".bubble-text");
+      const indicator = textEl.querySelector(".typing-indicator");
+      if (indicator) indicator.remove();
+
+      addConsoleEntry('incoming', 'Analysis Complete', {
+        tokens_received: analyzeStreamText.length,
+        preview: analyzeStreamText.substring(0, 100) + '...'
+      }, '✅', 'tool');
+
+      analyzeStreamBubble = null;
+      analyzeStreamText = "";
+      analyzeWs.close();
+      analyzeWs = null;
+    } else if (data.error) {
+      const textEl = analyzeStreamBubble.querySelector(".bubble-text");
+      const indicator = textEl.querySelector(".typing-indicator");
+      if (indicator) indicator.remove();
+      textEl.textContent += "\n[Error]: " + data.error;
+
+      addConsoleEntry('error', 'Analysis Error: ' + data.error, data, '⚠️', 'tool');
+
+      analyzeStreamBubble = null;
+      analyzeStreamText = "";
+      analyzeWs.close();
+      analyzeWs = null;
+    }
+  };
+
+  analyzeWs.onerror = function (e) {
+    console.error("[analyze_ws] error", e);
+    addConsoleEntry('error', 'Analyze WebSocket Error', { error: e.type }, '⚠️', 'system');
+  };
+
+  analyzeWs.onclose = function () {
+    // cleanup
+    if (analyzeStreamBubble) {
+      const textEl = analyzeStreamBubble.querySelector(".bubble-text");
+      const indicator = textEl.querySelector(".typing-indicator");
+      if (indicator) indicator.remove();
+    }
+    analyzeWs = null;
+  };
 }
 
 // Update existing message bubble text
@@ -743,9 +886,18 @@ function addSubmitHandler() {
       // Clear input
       messageInput.value = "";
 
-      // Send message to server
-      sendMessage(message);
-      console.log("[CLIENT TO AGENT] " + message);
+      // Check if the message contains an image URL → route to direct streaming
+      const imageUrl = extractImageUrl(message);
+      if (imageUrl) {
+        // Build the prompt from the rest of the message (text minus the URL)
+        const prompt = message.replace(imageUrl, "").trim() || "Describe this medical image in detail.";
+        startDirectAnalysis(imageUrl, prompt);
+        console.log("[CLIENT → ANALYZE PROXY] " + imageUrl);
+      } else {
+        // Normal text message → send through the agent WebSocket
+        sendMessage(message);
+        console.log("[CLIENT TO AGENT] " + message);
+      }
     }
     return false;
   };

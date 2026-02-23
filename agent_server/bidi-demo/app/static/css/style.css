@@ -245,6 +245,31 @@ h1 {
   margin-right: 0.25rem;
 }
 
+/* ── Tool-stream bubble: Medical Analysis (distinct teal/green) ── */
+.message.tool-stream .bubble {
+  background: linear-gradient(135deg, #e0f7f1 0%, #d1f0e8 100%);
+  color: #1b4332;
+  border-left: 4px solid #2d9c6f;
+  border-bottom-left-radius: 0.25rem;
+  max-width: 85%;
+}
+
+.tool-stream-label {
+  display: block;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #2d9c6f;
+  margin-bottom: 0.375rem;
+}
+
+.message.tool-stream .bubble-text {
+  white-space: pre-wrap;
+  font-size: 0.9375rem;
+  line-height: 1.65;
+}
+
 /* Typing indicator */
 .typing-indicator {
   display: inline-block;
