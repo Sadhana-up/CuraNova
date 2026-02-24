@@ -1,10 +1,25 @@
-"""CuraNova Medical Image Analysis Agent — ADK Bidi-streaming."""
+"""CuraNova Medical Image Analysis Agent — ADK Bidi-streaming.
 
-import os
-import json
+Architecture
+────────────
+ALL messages (text, URL, uploaded image) go through the main ADK WebSocket.
+The Gemini agent reads every turn and decides autonomously whether a tool call
+is warranted.
+
+When the agent decides to run a medical analysis tool, the tool:
+  1. Immediately returns a JSON "signal" string that tells main.py to push a
+     special `medical_stream_trigger` event to the Next.js client.
+  2. The Next.js client receives that event and opens its own direct WebSocket
+     to /ws/analyze, streaming tokens into the green "Medical Analysis" bubble —
+     exactly as before, but now fully under agent control.
+
+The agent keeps full conversation context (memory) throughout.
+"""
+
 import base64
-import websockets
-from typing import AsyncGenerator, Optional
+import json
+import os
+from typing import Optional
 
 from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
@@ -14,150 +29,107 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-
 # ──────────────────────────────────────────────────────────────
-# Helper: resolve Colab WebSocket base URL
+# SIGNAL PREFIX — main.py watches for this prefix in tool output
+# to know it must forward a medical_stream_trigger event.
 # ──────────────────────────────────────────────────────────────
-def _colab_ws_base() -> Optional[str]:
-    url = os.getenv("COLAB_BASE_URL", "").rstrip("/")
-    if not url:
-        return None
-    return url.replace("https://", "wss://").replace("http://", "ws://")
+_SIGNAL_PREFIX = "__MEDICAL_STREAM__:"
 
 
 # ──────────────────────────────────────────────────────────────
-# Tool 1: Analyze via image URL (streaming)
+# Tool 1: Trigger analysis via public image URL
 # ──────────────────────────────────────────────────────────────
-async def analyze_medical_image(image_url: str, prompt: str) -> AsyncGenerator[str, None]:
-    """Connects to the remote medical AI model and streams back the analysis
-    of a medical image token by token using its public URL.
+def analyze_medical_image(image_url: str, prompt: str) -> str:
+    """Triggers the CuraNova medical AI to analyse a medical image given its
+    public URL.
 
-    Use this tool when the user provides a direct image URL (e.g. https://...).
+    Call this tool whenever the user provides a direct image URL
+    (starting with http:// or https://) AND asks for a clinical or medical
+    analysis of that image.
 
-    CRITICAL: When you call this tool, STOP generating text immediately.
-    Wait for the stream of tokens from the tool. Relay the output exactly
-    as-is without adding your own interpretation or filler phrases.
+    Do NOT call this tool for general image descriptions or non-medical
+    questions — answer those directly.
 
     Args:
         image_url: The publicly accessible URL of the medical image.
         prompt: The clinical question or instruction for the analysis.
+
+    Returns:
+        A signal string that the backend uses to stream the analysis to the
+        client. After this call, tell the user their request is being
+        processed by the medical agent.
     """
-    ws_base = _colab_ws_base()
-    if not ws_base:
-        yield "Error: COLAB_BASE_URL is not configured."
-        return
-
-    endpoint = f"{ws_base}/ws/analyze/image-url"
-    payload = {"image_url": image_url, "prompt": prompt, "max_new_tokens": 500}
-
-    try:
-        with open("stream_debug.log", "a", encoding="utf-8") as f:
-            f.write(f"\n--- URL Analysis: {image_url}\nPrompt: {prompt}\n")
-
-        async with websockets.connect(endpoint) as ws:
-            await ws.send(json.dumps(payload))
-            async for message in ws:
-                data = json.loads(message)
-                if "token" in data:
-                    token = data["token"]
-                    with open("stream_debug.log", "a", encoding="utf-8") as f:
-                        f.write(token)
-                    yield token
-                elif data.get("status") == "done":
-                    break
-                elif "error" in data:
-                    yield f"\n[Server Error]: {data['error']}"
-                    break
-    except Exception as e:
-        yield f"\n[Connection Error]: {e}"
+    payload = {
+        "image_url": image_url,
+        "prompt": prompt,
+        "max_new_tokens": 500,
+    }
+    signal = _SIGNAL_PREFIX + json.dumps(payload)
+    return signal
 
 
 # ──────────────────────────────────────────────────────────────
-# Tool 2: Analyze via base64 image upload (streaming)
+# Tool 2: Trigger analysis for uploaded image(s)
 # ──────────────────────────────────────────────────────────────
-async def analyze_medical_image_upload(
+def analyze_medical_image_upload(
     image_b64: str,
     prompt: str,
     image_b64_2: str = "",
-) -> AsyncGenerator[str, None]:
-    """Connects to the remote medical AI model and streams back analysis
-    for one or two uploaded images encoded as base64 strings.
+) -> str:
+    """Triggers the CuraNova medical AI to analyse one or two uploaded images
+    that were encoded as base64 strings.
 
-    Use this tool when the user uploads an image file (camera capture or file picker).
-    The agent will have already extracted the base64 data from the inline_data parts.
+    Call this tool ONLY when:
+      - The user has uploaded an image (camera or file picker), AND
+      - The user is asking for a clinical / medical analysis of that image.
 
-    CRITICAL: Relay the output exactly as-is. Do NOT add filler or summarize.
+    Do NOT call this tool if the user shares a selfie or a non-medical image
+    and simply wants a description — answer those directly using your own
+    vision capability.
 
     Args:
-        image_b64: The primary image encoded in base64 (JPEG/PNG).
-        prompt: The clinical question or instruction for the analysis.
-        image_b64_2: Optional second image in base64 (leave empty if only one image).
+        image_b64: Primary image encoded as a base64 string (JPEG/PNG).
+        prompt: The clinical question or instruction from the user.
+        image_b64_2: Optional second image in base64 (leave empty for one image).
+
+    Returns:
+        A signal string that the backend uses to stream the analysis to the
+        client. After this call, tell the user their request is being
+        processed by the medical agent.
     """
-    ws_base = _colab_ws_base()
-    if not ws_base:
-        yield "Error: COLAB_BASE_URL is not configured."
-        return
-
-    # Route to unified endpoint when 2 images, base64 endpoint for 1
+    payload: dict = {
+        "image_b64": image_b64,
+        "prompt": prompt,
+        "max_new_tokens": 500,
+    }
     if image_b64_2:
-        endpoint = f"{ws_base}/ws/analyze/unified"
-        payload = {
-            "image_b64": image_b64,
-            "image_b64_2": image_b64_2,
-            "prompt": prompt,
-            "max_new_tokens": 500,
-        }
-    else:
-        endpoint = f"{ws_base}/ws/analyze/image-base64"
-        payload = {
-            "image_b64": image_b64,
-            "prompt": prompt,
-            "max_new_tokens": 500,
-        }
+        payload["image_b64_2"] = image_b64_2
 
-    try:
-        with open("stream_debug.log", "a", encoding="utf-8") as f:
-            f.write(f"\n--- Upload Analysis (b64 len={len(image_b64)})\nPrompt: {prompt}\n")
-
-        async with websockets.connect(endpoint) as ws:
-            await ws.send(json.dumps(payload))
-            async for message in ws:
-                data = json.loads(message)
-                if "token" in data:
-                    token = data["token"]
-                    with open("stream_debug.log", "a", encoding="utf-8") as f:
-                        f.write(token)
-                    yield token
-                elif data.get("status") == "done":
-                    break
-                elif "error" in data:
-                    yield f"\n[Server Error]: {data['error']}"
-                    break
-    except Exception as e:
-        yield f"\n[Connection Error]: {e}"
+    signal = _SIGNAL_PREFIX + json.dumps(payload)
+    return signal
 
 
 # ──────────────────────────────────────────────────────────────
-# Before-model callback: intercept uploaded images
+# Before-model callback — intercept uploaded images
 #
-# When the client sends an image via the ADK bidi stream
-# ({ type: "image", data: "<b64>" }), it arrives as inline_data
-# inside the LlmRequest. We detect it here, extract the base64
-# strings, store them in callback_context.state so the agent's
-# instruction can reference them, and inject a directive telling
-# the agent to call analyze_medical_image_upload.
+# When the client sends `{ type: "image", data: "<b64>" }` through the
+# bidi stream, main.py wraps it as inline_data on a Content object and
+# places it in the LiveRequestQueue. This callback intercepts that Content
+# before Gemini sees it, extracts the base64 bytes, stores them in
+# callback_context.state, and rewrites the user message as a text-only
+# directive so Gemini can decide whether a medical analysis is needed.
 # ──────────────────────────────────────────────────────────────
 async def before_model_callback(
     callback_context: CallbackContext,
     llm_request: LlmRequest,
 ) -> Optional[genai_types.Content]:
-    """Detect inline image uploads and prepare the agent to call
-    analyze_medical_image_upload with the extracted base64 data."""
+    """Detect inline image uploads and expose base64 data to the agent via
+    a text directive — the agent then decides whether to call a tool."""
 
     if not llm_request.contents:
         return None
 
-    # Collect the last user turn parts
+    # Find the last user turn
     last_user_content = None
     for content in reversed(llm_request.contents):
         if getattr(content, "role", None) == "user":
@@ -168,13 +140,12 @@ async def before_model_callback(
         return None
 
     parts = getattr(last_user_content, "parts", []) or []
-    images_b64 = []
-    text_parts = []
+    images_b64: list[str] = []
+    text_parts: list[str] = []
 
     for part in parts:
         inline = getattr(part, "inline_data", None)
         if inline and getattr(inline, "mime_type", "").startswith("image/"):
-            # Convert bytes to base64 string for the tool
             raw = getattr(inline, "data", b"")
             if isinstance(raw, (bytes, bytearray)):
                 images_b64.append(base64.b64encode(raw).decode("utf-8"))
@@ -189,79 +160,87 @@ async def before_model_callback(
     # Enforce max-2 limit
     images_b64 = images_b64[:2]
 
-    prompt = " ".join(text_parts).strip() or "Describe this medical image in detail."
+    prompt = " ".join(text_parts).strip() or "Describe this image."
 
-    # Store in state so the agent can reference if needed
+    # Store base64 data in session state for the agent to reference
     callback_context.state["uploaded_images_b64"] = images_b64
     callback_context.state["uploaded_image_count"] = len(images_b64)
     callback_context.state["upload_prompt"] = prompt
 
-    # Build a directive that tells the model to immediately call the upload tool
+    # Build indexes into state for the tool-call directive
     if len(images_b64) == 2:
-        directive = (
-            f"The user has uploaded 2 medical images. "
-            f"Call analyze_medical_image_upload with "
-            f"image_b64=state['uploaded_images_b64'][0], "
-            f"image_b64_2=state['uploaded_images_b64'][1], "
-            f"and prompt=\"{prompt}\". "
-            f"Relay the streaming output exactly as-is."
+        image_args = (
+            f"image_b64=\"{images_b64[0][:30]}...\" "
+            f"image_b64_2=\"{images_b64[1][:30]}...\" "
         )
     else:
-        directive = (
-            f"The user has uploaded a medical image. "
-            f"Call analyze_medical_image_upload with "
-            f"image_b64=state['uploaded_images_b64'][0] and "
-            f"prompt=\"{prompt}\". "
-            f"Relay the streaming output exactly as-is."
-        )
+        image_args = f"image_b64=\"{images_b64[0][:30]}...\" "
 
-    # Replace the user message inline_data with a text-only directive
-    # so the model sees instructions rather than raw bytes
-    new_parts = [genai_types.Part(text=directive)]
+    directive = (
+        f"The user sent {len(images_b64)} image(s) with this message: \"{prompt}\"\n\n"
+        f"The full base64 image data is stored in session state:\n"
+        f"  state['uploaded_images_b64'][0] = (primary image, {len(images_b64[0])} chars)\n"
+        + (f"  state['uploaded_images_b64'][1] = (second image, {len(images_b64[1])} chars)\n" if len(images_b64) == 2 else "")
+        + f"\nDecide: does this image require a CLINICAL / MEDICAL analysis?\n"
+        f"- If YES → call analyze_medical_image_upload with the full base64 string(s) from state.\n"
+        f"- If NO  → describe the image(s) using your own vision capability and answer normally.\n"
+        f"\nIMPORTANT: When calling the tool, pass the COMPLETE base64 string, not a truncated version."
+    )
 
-    # Patch the last user content in the request
-    last_user_content.parts = new_parts
+    # Patch the user message to be text-only
+    last_user_content.parts = [genai_types.Part(text=directive)]
 
-    return None  # None = proceed to LLM (with patched request)
+    # Store actual b64 values so the model can access them mid-prompt
+    # (Gemini will see the directive text and must read from state for full data)
+    return None  # Proceed to LLM with patched request
 
 
 # ──────────────────────────────────────────────────────────────
-# Root Agent — Specialized Medical Image Analyst
+# Root Agent
 # ──────────────────────────────────────────────────────────────
-# Available models:
-# - Gemini 2.0 Flash (Experimental): "gemini-2.0-flash-exp"
-# - Gemini 1.5 Flash: "gemini-1.5-flash"
-# - Gemini 1.5 Flash-8B: "gemini-1.5-flash-8b"
 agent = Agent(
     name="CuraNovaMedicalAgent",
     model=os.getenv("DEMO_AGENT_MODEL", "gemini-2.0-flash-exp"),
     before_model_callback=before_model_callback,
-    instruction="""You are CuraNova, a specialized medical imaging AI assistant.
+    instruction="""You are CuraNova, a specialized medical AI assistant with deep expertise in medical imaging and clinical knowledge.
 
-## Image Handling
+You have full memory of the conversation. Always use previous context when answering.
 
-### Scenario 1 — Text-only questions
-Answer the user's medical question helpfully and concisely.
-Always remind users that your information is for educational purposes only
-and is NOT a substitute for professional medical advice.
+## Decision Framework
 
-### Scenario 2 — Image URL + prompt
-If the user message contains a direct image URL (e.g. https://...), call
-`analyze_medical_image` with the URL and the user's question.
-Relay the streaming output EXACTLY as-is without adding your own commentary.
+### Text-only questions (no images)
+Answer the user's medical or health questions directly, helpfully, and concisely.
+Always note that your responses are for educational purposes and NOT a substitute for professional medical advice.
 
-### Scenario 3 — Uploaded image(s) + prompt
-If the user uploads image files (camera or file picker), the
-`before_model_callback` has already prepared base64 strings in state and
-will inject a directive. Follow that directive and call
-`analyze_medical_image_upload` immediately.
-Relay the streaming output EXACTLY as-is without adding your own commentary.
+### Image URL in the message (e.g. https://...)
+If the user provides a direct image URL AND is asking for a clinical or medical analysis:
+→ Call `analyze_medical_image(image_url=<url>, prompt=<user's question>)`
+→ The tool will implicitly trigger the medical analysis stream.
+→ Do NOT repeat the tool output or the signal.
+→ IMMEDIATELY say: "Your request is being processed by our medical imaging agent. The analysis will appear momentarily ✨"
+→ Do NOT add any other text, explanation, or filler.
+
+If the user shares an image URL but is NOT asking for medical analysis (e.g. "what does this look like?"):
+→ Answer normally without calling any tool.
+
+### Uploaded image(s) (via camera/file picker)
+The `before_model_callback` will inject a directive describing the uploaded images and asking you to decide.
+
+Read the directive carefully:
+- If the user is asking for CLINICAL / MEDICAL analysis → call `analyze_medical_image_upload` with the FULL base64 string(s) from state
+- If the user is NOT asking for medical analysis (selfie, casual question, "what's in this picture?") → describe the image using your own vision capability and answer directly
+
+After calling either analysis tool:
+→ The tool will implicitly trigger the medical analysis stream.
+→ Do NOT repeat the tool output or the signal.
+→ IMMEDIATELY say: "Your request is being processed by our medical imaging agent. The analysis will appear momentarily ✨"
+→ Do NOT add any other text, explanation, or filler.
 
 ## Critical rules
-- Do NOT preface tool calls with "Okay, analyzing..." or similar filler.
-- Do NOT summarize the tool output. Relay it verbatim.
-- After relaying a tool result, you may briefly offer to answer follow-up questions.
-- Maximum 2 images per request are supported.
+- Always maintain conversation context and remember previous turns.
+- After a tool call, briefly acknowledge and offer to answer follow-up questions.
+- Maximum 2 images per request.
+- Never truncate or modify the base64 strings when passing them to tools.
 """,
     tools=[analyze_medical_image, analyze_medical_image_upload],
 )

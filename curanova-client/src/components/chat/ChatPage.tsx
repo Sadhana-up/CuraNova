@@ -14,6 +14,7 @@ import {
   MicOff,
   Camera,
   Paperclip,
+  X,
   Wifi,
   WifiOff,
   Loader2,
@@ -149,8 +150,8 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
       {/* Avatar */}
       <div
         className={`shrink-0 w-7 h-7 rounded-lg flex items-center justify-center mt-0.5 ${isUser
-            ? "bg-violet-500/15 border border-violet-500/20"
-            : "bg-white/[0.06] border border-white/[0.08]"
+          ? "bg-violet-500/15 border border-violet-500/20"
+          : "bg-white/[0.06] border border-white/[0.08]"
           }`}
       >
         {isUser ? (
@@ -163,8 +164,8 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
       {/* Bubble */}
       <div
         className={`max-w-[75%] min-w-0 px-4 py-2.5 rounded-2xl ${isUser
-            ? "bg-violet-500/90 text-white rounded-tr-md"
-            : "bg-white/[0.06] border border-white/[0.06] text-white/85 rounded-tl-md"
+          ? "bg-violet-500/90 text-white rounded-tr-md"
+          : "bg-white/[0.06] border border-white/[0.06] text-white/85 rounded-tl-md"
           } ${msg.isTranscription ? "ring-1 ring-white/10" : ""}`}
       >
         {msg.isTranscription && isUser && (
@@ -216,6 +217,10 @@ export default function ChatPage() {
   });
 
   const [inputValue, setInputValue] = useState("");
+  // Staged attachments — files are held here until user hits Send
+  const [pendingFiles, setPendingFiles] = useState<
+    { file: File; previewUrl: string }[]
+  >([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -242,6 +247,22 @@ export default function ChatPage() {
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
     const text = inputValue.trim();
+
+    // If there are staged image attachments, send them WITH the prompt so
+    // the agent receives both the image and the clinical question together.
+    if (pendingFiles.length > 0) {
+      const prompt = text || undefined;
+      // Send all pending images — agent's before_model_callback will group
+      // them into a single turn and decide whether to do a tool call.
+      pendingFiles.forEach(({ file }) => sendImageUpload(file, prompt));
+      setPendingFiles([]);
+      setInputValue("");
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      inputRef.current?.focus();
+      return;
+    }
+
+    // Plain text message (including image URLs — agent decides)
     if (!text) return;
     sendTextMessage(text);
     setInputValue("");
@@ -263,17 +284,24 @@ export default function ChatPage() {
         f.type.startsWith("image/")
       );
       if (!files.length) return;
-      // Enforce max 2 images — slice first 2
-      files.slice(0, 2).forEach((file) => {
-        const prompt = inputValue.trim() || undefined;
-        sendImageUpload(file, prompt);
+
+      // Stage files (max 2 total across all batches)
+      setPendingFiles((prev) => {
+        const remaining = 2 - prev.length;
+        if (remaining <= 0) return prev;
+        const toAdd = files.slice(0, remaining).map((file) => ({
+          file,
+          previewUrl: URL.createObjectURL(file),
+        }));
+        return [...prev, ...toAdd];
       });
-      // Clear prompt after sending
-      setInputValue("");
-      // Reset file input so same file can be re-selected
+
+      // Reset file input so the same file can trigger onChange again
       if (fileInputRef.current) fileInputRef.current.value = "";
+      // Focus input so user can type their prompt
+      inputRef.current?.focus();
     },
-    [sendImageUpload, inputValue]
+    [] // no deps — only uses refs and setState
   );
 
   const isConnected = connectionStatus === "connected";
@@ -404,6 +432,48 @@ export default function ChatPage() {
           id="image-upload-input"
           onChange={handleFileUpload}
         />
+
+        {/* Staged image previews */}
+        <AnimatePresence>
+          {pendingFiles.length > 0 && (
+            <motion.div
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: "auto" }}
+              exit={{ opacity: 0, height: 0 }}
+              className="max-w-3xl mx-auto px-4 pt-2 flex gap-2 overflow-hidden"
+            >
+              {pendingFiles.map(({ previewUrl }, idx) => (
+                <motion.div
+                  key={previewUrl}
+                  initial={{ opacity: 0, scale: 0.85 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.85 }}
+                  className="relative shrink-0"
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={previewUrl}
+                    alt={`Attachment ${idx + 1}`}
+                    className="w-14 h-14 rounded-xl object-cover ring-1 ring-white/10"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      URL.revokeObjectURL(previewUrl);
+                      setPendingFiles((prev) =>
+                        prev.filter((_, i) => i !== idx)
+                      );
+                    }}
+                    className="absolute -top-1.5 -right-1.5 w-4.5 h-4.5 bg-black/80 border border-white/20 rounded-full flex items-center justify-center text-white/70 hover:text-white transition-colors"
+                    title="Remove"
+                  >
+                    <X className="w-2.5 h-2.5" />
+                  </button>
+                </motion.div>
+              ))}
+            </motion.div>
+          )}
+        </AnimatePresence>
         <form
           onSubmit={handleSubmit}
           className="max-w-3xl mx-auto px-4 py-3 flex items-center gap-2"
@@ -431,8 +501,8 @@ export default function ChatPage() {
             disabled={isAudioActive}
             onClick={() => startAudio()}
             className={`p-2.5 rounded-xl transition-all ${isAudioActive
-                ? "bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/20"
-                : "hover:bg-white/[0.06] text-white/35 hover:text-white/60"
+              ? "bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/20"
+              : "hover:bg-white/[0.06] text-white/35 hover:text-white/60"
               }`}
             title={isAudioActive ? "Audio active" : "Start audio"}
           >
@@ -461,7 +531,7 @@ export default function ChatPage() {
             type="submit"
             whileHover={{ scale: 1.05 }}
             whileTap={{ scale: 0.9 }}
-            disabled={!isConnected || !inputValue.trim()}
+            disabled={!isConnected || (!inputValue.trim() && pendingFiles.length === 0)}
             className="p-2.5 rounded-xl bg-violet-500/90 text-white disabled:opacity-20 disabled:cursor-not-allowed hover:bg-violet-500 transition-all"
           >
             <Send className="w-[18px] h-[18px]" />
