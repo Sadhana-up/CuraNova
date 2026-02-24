@@ -13,6 +13,7 @@ import {
   Mic,
   MicOff,
   Camera,
+  Paperclip,
   Wifi,
   WifiOff,
   Loader2,
@@ -147,11 +148,10 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
     >
       {/* Avatar */}
       <div
-        className={`shrink-0 w-7 h-7 rounded-lg flex items-center justify-center mt-0.5 ${
-          isUser
+        className={`shrink-0 w-7 h-7 rounded-lg flex items-center justify-center mt-0.5 ${isUser
             ? "bg-violet-500/15 border border-violet-500/20"
             : "bg-white/[0.06] border border-white/[0.08]"
-        }`}
+          }`}
       >
         {isUser ? (
           <User className="w-3.5 h-3.5 text-violet-400" />
@@ -162,11 +162,10 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
 
       {/* Bubble */}
       <div
-        className={`max-w-[75%] min-w-0 px-4 py-2.5 rounded-2xl ${
-          isUser
+        className={`max-w-[75%] min-w-0 px-4 py-2.5 rounded-2xl ${isUser
             ? "bg-violet-500/90 text-white rounded-tr-md"
             : "bg-white/[0.06] border border-white/[0.06] text-white/85 rounded-tl-md"
-        } ${msg.isTranscription ? "ring-1 ring-white/10" : ""}`}
+          } ${msg.isTranscription ? "ring-1 ring-white/10" : ""}`}
       >
         {msg.isTranscription && isUser && (
           <Mic className="inline w-3 h-3 mr-1 opacity-50 -mt-0.5" />
@@ -206,6 +205,7 @@ export default function ChatPage() {
     connectionStatus,
     sendTextMessage,
     sendImage,
+    sendImageUpload,
     sendAudioChunk,
   } = useWebSocket({
     serverUrl: SERVER_URL,
@@ -219,6 +219,7 @@ export default function ChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
 
   // Auto-scroll
@@ -249,9 +250,30 @@ export default function ChatPage() {
 
   const handleCameraCapture = useCallback(
     (base64Data: string, imageDataUrl: string) => {
-      sendImage(base64Data, imageDataUrl);
+      const prompt = inputValue.trim() || undefined;
+      setInputValue("");
+      sendImage(base64Data, imageDataUrl, prompt);
     },
-    [sendImage]
+    [sendImage, inputValue]
+  );
+
+  const handleFileUpload = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(e.target.files || []).filter((f) =>
+        f.type.startsWith("image/")
+      );
+      if (!files.length) return;
+      // Enforce max 2 images — slice first 2
+      files.slice(0, 2).forEach((file) => {
+        const prompt = inputValue.trim() || undefined;
+        sendImageUpload(file, prompt);
+      });
+      // Clear prompt after sending
+      setInputValue("");
+      // Reset file input so same file can be re-selected
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    },
+    [sendImageUpload, inputValue]
   );
 
   const isConnected = connectionStatus === "connected";
@@ -372,12 +394,34 @@ export default function ChatPage() {
 
       {/* ── Input bar ── */}
       <div className="relative z-10 border-t border-white/[0.06] bg-[#0a0a0f]/90 backdrop-blur-xl">
+        {/* Hidden file input for image uploads */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          multiple
+          className="hidden"
+          id="image-upload-input"
+          onChange={handleFileUpload}
+        />
         <form
           onSubmit={handleSubmit}
           className="max-w-3xl mx-auto px-4 py-3 flex items-center gap-2"
         >
           {/* Camera */}
           <CameraModal onCapture={handleCameraCapture} />
+
+          {/* File upload */}
+          <motion.button
+            type="button"
+            whileHover={{ scale: 1.05 }}
+            whileTap={{ scale: 0.95 }}
+            onClick={() => fileInputRef.current?.click()}
+            className="p-2.5 rounded-xl hover:bg-white/[0.06] text-white/35 hover:text-white/60 transition-all"
+            title="Upload image (max 2)"
+          >
+            <Paperclip className="w-[18px] h-[18px]" />
+          </motion.button>
 
           {/* Audio */}
           <motion.button
@@ -386,11 +430,10 @@ export default function ChatPage() {
             whileTap={{ scale: 0.95 }}
             disabled={isAudioActive}
             onClick={() => startAudio()}
-            className={`p-2.5 rounded-xl transition-all ${
-              isAudioActive
+            className={`p-2.5 rounded-xl transition-all ${isAudioActive
                 ? "bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/20"
                 : "hover:bg-white/[0.06] text-white/35 hover:text-white/60"
-            }`}
+              }`}
             title={isAudioActive ? "Audio active" : "Start audio"}
           >
             {isAudioActive ? (

@@ -96,7 +96,7 @@ class ImageURLRequest(BaseModel):
 
 
 # ── Shared input builder ──────────────────────────────────────
-# Accepts either a single Optional[Image] or a List[Image] for multi-image.
+# Accepts a single Optional[Image] OR a List[Image] for multi-image.
 
 def build_inputs(model, processor, image_or_images, prompt: str):
     # Normalise to a clean list of PIL images
@@ -449,12 +449,12 @@ async def ws_analyze_unified(websocket: WebSocket):
     try:
         data = await websocket.receive_json()
 
-        prompt        = data.get("prompt",        "Describe this medical image. What do you see?")
-        max_new_tokens= int(data.get("max_new_tokens", 500))
-        image_url     = data.get("image_url",     "")
-        image_url_2   = data.get("image_url_2",   "")
-        image_b64     = data.get("image_b64",     "")
-        image_b64_2   = data.get("image_b64_2",   "")
+        prompt         = data.get("prompt",        "Describe this medical image. What do you see?")
+        max_new_tokens = int(data.get("max_new_tokens", 500))
+        image_url      = data.get("image_url",     "")
+        image_url_2    = data.get("image_url_2",   "")
+        image_b64      = data.get("image_b64",     "")
+        image_b64_2    = data.get("image_b64_2",   "")
 
         print(
             f"[SERVER] 📩 unified prompt={prompt[:60]!r} "

@@ -33,7 +33,8 @@ interface UseWebSocketReturn {
   consoleEntries: ConsoleEntry[];
   connectionStatus: ConnectionStatus;
   sendTextMessage: (text: string) => void;
-  sendImage: (base64Data: string, imageDataUrl?: string) => void;
+  sendImage: (base64Data: string, imageDataUrl?: string, prompt?: string) => void;
+  sendImageUpload: (file: File, prompt?: string) => void;
   sendAudioChunk: (pcmData: ArrayBuffer) => void;
   clearConsole: () => void;
 }
@@ -184,10 +185,23 @@ export function useWebSocket({
   }, []);
 
   // ── Direct analysis via /ws/analyze ──
+  // Accepts a flexible payload covering all three scenarios:
+  //   text-only:     { prompt }
+  //   image URL:     { image_url, prompt }
+  //   image upload:  { image_b64, prompt }  or  { image_b64, image_b64_2, prompt }
+  //   mixed/multi:   any combo of the above fields
+  //
+  // MAX 2 images total (enforced on server side too).
   const startDirectAnalysis = useCallback(
-    (imageUrl: string, prompt: string) => {
-      const wsProtocol =
-        serverUrl.startsWith("https") ? "wss:" : "ws:";
+    (payload: {
+      prompt: string;
+      image_url?: string;
+      image_url_2?: string;
+      image_b64?: string;
+      image_b64_2?: string;
+      max_new_tokens?: number;
+    }) => {
+      const wsProtocol = serverUrl.startsWith("https") ? "wss:" : "ws:";
       const host = serverUrl.replace(/^https?:\/\//, "");
       const analyzeUrl = `${wsProtocol}//${host}/ws/analyze`;
 
@@ -202,7 +216,7 @@ export function useWebSocket({
       addConsoleEntry(
         "outgoing",
         "Direct Analysis Request",
-        { image_url: imageUrl, prompt, endpoint: analyzeUrl },
+        { endpoint: analyzeUrl, ...payload },
         "🩺",
         "system"
       );
@@ -211,13 +225,7 @@ export function useWebSocket({
       analyzeWsRef.current = ws;
 
       ws.onopen = () => {
-        ws.send(
-          JSON.stringify({
-            image_url: imageUrl,
-            prompt,
-            max_new_tokens: 500,
-          })
-        );
+        ws.send(JSON.stringify({ max_new_tokens: 500, ...payload }));
       };
 
       ws.onmessage = (event) => {
@@ -671,7 +679,7 @@ export function useWebSocket({
         const prompt =
           message.replace(imageUrl, "").trim() ||
           "Describe this medical image in detail.";
-        startDirectAnalysis(imageUrl, prompt);
+        startDirectAnalysis({ image_url: imageUrl, prompt });
       } else {
         if (wsRef.current?.readyState === WebSocket.OPEN) {
           wsRef.current.send(JSON.stringify({ type: "text", text: message }));
@@ -688,31 +696,61 @@ export function useWebSocket({
     [addUserMessage, addConsoleEntry, startDirectAnalysis]
   );
 
-  // ── Send image ──
+  // ── Send image (camera capture) → Colab via /ws/analyze with image_b64 ──
+  // Routes through the direct-streaming proxy so responses stream back
+  // to the chat just like image URL analysis does.
   const sendImage = useCallback(
-    (base64Data: string, imageDataUrl?: string) => {
-      // Add image to the chat messages (chronological order)
+    (base64Data: string, imageDataUrl?: string, prompt?: string) => {
       const dataUrl = imageDataUrl || `data:image/jpeg;base64,${base64Data}`;
       addUserImageMessage(dataUrl);
 
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: "image",
-            data: base64Data,
-            mimeType: "image/jpeg",
-          })
-        );
+      const effectivePrompt =
+        prompt || "Describe this medical image in detail. Provide a clinical analysis.";
+
+      addConsoleEntry(
+        "outgoing",
+        "Image Sent → Colab analysis",
+        { mimeType: "image/jpeg", b64_len: base64Data.length },
+        "📷",
+        "user"
+      );
+
+      startDirectAnalysis({ image_b64: base64Data, prompt: effectivePrompt });
+    },
+    [addUserImageMessage, addConsoleEntry, startDirectAnalysis]
+  );
+
+  // ── Send image upload (File object) → Colab via /ws/analyze ──
+  // Reads the file, converts to base64, then calls startDirectAnalysis.
+  // Supports up to 2 files; any extras are silently ignored.
+  const sendImageUpload = useCallback(
+    (file: File, prompt?: string) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const result = reader.result as string;
+        // result is "data:<mime>;base64,<data>"
+        const base64 = result.split(",")[1];
+        const mimeType = result.split(";")[0].replace("data:", "") || "image/jpeg";
+        const dataUrl = result;
+
+        addUserImageMessage(dataUrl);
+
+        const effectivePrompt =
+          prompt || "Describe this medical image in detail. Provide a clinical analysis.";
+
         addConsoleEntry(
           "outgoing",
-          "Image Sent",
-          { mimeType: "image/jpeg", size: base64Data.length },
-          "📷",
+          `File Upload → Colab analysis (${file.name})`,
+          { name: file.name, size: file.size, mime: mimeType },
+          "📎",
           "user"
         );
-      }
+
+        startDirectAnalysis({ image_b64: base64, prompt: effectivePrompt });
+      };
+      reader.readAsDataURL(file);
     },
-    [addUserImageMessage, addConsoleEntry]
+    [addUserImageMessage, addConsoleEntry, startDirectAnalysis]
   );
 
   // ── Send audio chunk (binary) ──
@@ -744,6 +782,7 @@ export function useWebSocket({
     connectionStatus,
     sendTextMessage,
     sendImage,
+    sendImageUpload,
     sendAudioChunk,
     clearConsole,
   };

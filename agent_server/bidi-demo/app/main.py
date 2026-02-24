@@ -73,49 +73,100 @@ async def root():
 
 @app.websocket("/ws/analyze")
 async def analyze_proxy(websocket: WebSocket) -> None:
-    """WebSocket proxy that streams tokens directly from the Colab medical AI server.
+    """WebSocket proxy that streams tokens from the Colab medical AI server.
 
-    The client sends a JSON message with {image_url, prompt} and receives
-    a stream of {token: "..."} messages, ending with {status: "done"}.
-    This bypasses the ADK agent entirely for zero-filler direct streaming.
+    Handles ALL three scenarios:
+      1) Text-only prompt            → routes to /ws/analyze/text
+      2) Image URL + prompt          → routes to /ws/analyze/image-url
+      3) Image upload (base64/file)  → routes to /ws/analyze/image-base64
+      Mixed / multi-image            → routes to /ws/analyze/unified
+
+    Expected JSON payload (all image fields are optional):
+    {
+      "prompt":       "...",
+      "max_new_tokens": 500,
+      "image_url":    "https://...",   // optional, first image URL
+      "image_url_2":  "https://...",   // optional, second image URL
+      "image_b64":    "<base64>",      // optional, uploaded file 1
+      "image_b64_2":  "<base64>"       // optional, uploaded file 2
+    }
     """
     await websocket.accept()
 
     try:
-        # Receive the analysis request from the client
         request_data = await websocket.receive_text()
         request = json.loads(request_data)
-        image_url = request.get("image_url", "")
-        prompt = request.get("prompt", "Describe this medical image in detail.")
+
+        prompt         = request.get("prompt", "Describe this medical image in detail.")
         max_new_tokens = request.get("max_new_tokens", 500)
+        image_url      = request.get("image_url", "")
+        image_url_2    = request.get("image_url_2", "")
+        image_b64      = request.get("image_b64", "")
+        image_b64_2    = request.get("image_b64_2", "")
 
-        logger.info(f"[analyze_proxy] image_url={image_url[:80]}, prompt={prompt[:60]}")
+        logger.info(
+            f"[analyze_proxy] prompt={prompt[:60]!r} "
+            f"url1={'yes' if image_url else 'no'} url2={'yes' if image_url_2 else 'no'} "
+            f"b64_1={'yes' if image_b64 else 'no'} b64_2={'yes' if image_b64_2 else 'no'}"
+        )
 
-        # Build the Colab WebSocket URL
+        # Build Colab WebSocket base URL
         colab_base_url = os.getenv("COLAB_BASE_URL", "")
         if not colab_base_url:
             await websocket.send_json({"error": "COLAB_BASE_URL is not configured."})
             await websocket.close()
             return
 
-        ws_url = (
+        ws_base = (
             colab_base_url
             .replace("https://", "wss://")
             .replace("http://", "ws://")
             .rstrip("/")
         )
-        endpoint = f"{ws_url}/ws/analyze/image-url"
 
-        payload = {
-            "image_url": image_url,
-            "prompt": prompt,
-            "max_new_tokens": max_new_tokens,
-        }
+        has_b64  = bool(image_b64 or image_b64_2)
+        has_url  = bool(image_url or image_url_2)
+        is_mixed = (has_b64 and has_url) or bool(image_b64 and image_b64_2) or bool(image_url and image_url_2)
 
-        # Connect to Colab and stream tokens back to the browser
+        # ── Smart routing ────────────────────────────────────────
+        if is_mixed:
+            endpoint = f"{ws_base}/ws/analyze/unified"
+            payload = {
+                "prompt": prompt, "max_new_tokens": max_new_tokens,
+                "image_url": image_url, "image_url_2": image_url_2,
+                "image_b64": image_b64, "image_b64_2": image_b64_2,
+            }
+            logger.info("[analyze_proxy] → unified")
+
+        elif has_b64:
+            endpoint = f"{ws_base}/ws/analyze/image-base64"
+            payload = {
+                "image_b64": image_b64,
+                "prompt": prompt,
+                "max_new_tokens": max_new_tokens,
+            }
+            logger.info("[analyze_proxy] → image-base64")
+
+        elif has_url:
+            endpoint = f"{ws_base}/ws/analyze/image-url"
+            payload = {
+                "image_url": image_url,
+                "prompt": prompt,
+                "max_new_tokens": max_new_tokens,
+            }
+            logger.info("[analyze_proxy] → image-url")
+
+        else:
+            endpoint = f"{ws_base}/ws/analyze/text"
+            payload = {
+                "prompt": prompt,
+                "max_new_tokens": max_new_tokens,
+            }
+            logger.info("[analyze_proxy] → text")
+
+        # ── Stream from Colab → client ───────────────────────────
         async with websockets.connect(endpoint) as colab_ws:
             await colab_ws.send(json.dumps(payload))
-
             async for message in colab_ws:
                 data = json.loads(message)
                 if "token" in data:
