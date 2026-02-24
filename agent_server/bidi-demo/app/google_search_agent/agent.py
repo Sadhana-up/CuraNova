@@ -23,6 +23,7 @@ from typing import Optional
 
 from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
+from google.adk.tools.tool_context import ToolContext
 from google.adk.models.llm_request import LlmRequest
 from google.genai import types as genai_types
 from dotenv import load_dotenv
@@ -72,38 +73,34 @@ def analyze_medical_image(image_url: str, prompt: str) -> str:
 # Tool 2: Trigger analysis for uploaded image(s)
 # ──────────────────────────────────────────────────────────────
 def analyze_medical_image_upload(
-    image_b64: str,
     prompt: str,
-    image_b64_2: str = "",
+    tool_context: ToolContext,
 ) -> str:
-    """Triggers the CuraNova medical AI to analyse one or two uploaded images
-    that were encoded as base64 strings.
+    """Triggers the CuraNova medical AI to analyse one or two uploaded images.
 
     Call this tool ONLY when:
-      - The user has uploaded an image (camera or file picker), AND
+      - The user has uploaded an image (and the directive says so), AND
       - The user is asking for a clinical / medical analysis of that image.
 
-    Do NOT call this tool if the user shares a selfie or a non-medical image
-    and simply wants a description — answer those directly using your own
-    vision capability.
+    The actual image data is retrieved from session state automatically.
 
     Args:
-        image_b64: Primary image encoded as a base64 string (JPEG/PNG).
         prompt: The clinical question or instruction from the user.
-        image_b64_2: Optional second image in base64 (leave empty for one image).
 
     Returns:
-        A signal string that the backend uses to stream the analysis to the
-        client. After this call, tell the user their request is being
-        processed by the medical agent.
+        A signal string for the backend streaming mechanism.
     """
+    images_b64 = tool_context.state.get("uploaded_images_b64", [])
+    if not images_b64:
+        return "ERROR: No uploaded images found in session state."
+
     payload: dict = {
-        "image_b64": image_b64,
+        "image_b64": images_b64[0],
         "prompt": prompt,
         "max_new_tokens": 500,
     }
-    if image_b64_2:
-        payload["image_b64_2"] = image_b64_2
+    if len(images_b64) > 1:
+        payload["image_b64_2"] = images_b64[1]
 
     signal = _SIGNAL_PREFIX + json.dumps(payload)
     return signal
@@ -168,23 +165,15 @@ async def before_model_callback(
     callback_context.state["upload_prompt"] = prompt
 
     # Build indexes into state for the tool-call directive
-    if len(images_b64) == 2:
-        image_args = (
-            f"image_b64=\"{images_b64[0][:30]}...\" "
-            f"image_b64_2=\"{images_b64[1][:30]}...\" "
-        )
-    else:
-        image_args = f"image_b64=\"{images_b64[0][:30]}...\" "
-
+    image_count = len(images_b64)
+    
     directive = (
-        f"The user sent {len(images_b64)} image(s) with this message: \"{prompt}\"\n\n"
-        f"The full base64 image data is stored in session state:\n"
-        f"  state['uploaded_images_b64'][0] = (primary image, {len(images_b64[0])} chars)\n"
-        + (f"  state['uploaded_images_b64'][1] = (second image, {len(images_b64[1])} chars)\n" if len(images_b64) == 2 else "")
-        + f"\nDecide: does this image require a CLINICAL / MEDICAL analysis?\n"
-        f"- If YES → call analyze_medical_image_upload with the full base64 string(s) from state.\n"
+        f"The user sent {image_count} image(s) with this message: \"{prompt}\"\n\n"
+        f"Decide: does this image require a CLINICAL / MEDICAL analysis?\n"
+        f"- If YES → call analyze_medical_image_upload(prompt=\"{prompt}\").\n"
+        f"  (The images are automatically retrieved from session state, no need to pass them).\n"
         f"- If NO  → describe the image(s) using your own vision capability and answer normally.\n"
-        f"\nIMPORTANT: When calling the tool, pass the COMPLETE base64 string, not a truncated version."
+        f"\nIMPORTANT: Do not try to access state['uploaded_images_b64'] yourself."
     )
 
     # Patch the user message to be text-only
@@ -214,27 +203,24 @@ Always note that your responses are for educational purposes and NOT a substitut
 
 ### Image URL in the message (e.g. https://...)
 If the user provides a direct image URL AND is asking for a clinical or medical analysis:
-→ Call `analyze_medical_image(image_url=<url>, prompt=<user's question>)`
-→ The tool will implicitly trigger the medical analysis stream.
-→ Do NOT repeat the tool output or the signal.
-→ IMMEDIATELY say: "Your request is being processed by our medical imaging agent. The analysis will appear momentarily ✨"
-→ Do NOT add any other text, explanation, or filler.
+1. FIRST, call the tool: `analyze_medical_image(image_url=<url>, prompt=<user's question>)`
+2. THEN, after the tool has been called, output the text: "Your request is being processed by our medical imaging agent. The analysis will appear momentarily ✨"
 
-If the user shares an image URL but is NOT asking for medical analysis (e.g. "what does this look like?"):
-→ Answer normally without calling any tool.
+Do not describe your plan ("I will call the tool..."). just CALL IT.
 
 ### Uploaded image(s) (via camera/file picker)
 The `before_model_callback` will inject a directive describing the uploaded images and asking you to decide.
 
 Read the directive carefully:
-- If the user is asking for CLINICAL / MEDICAL analysis → call `analyze_medical_image_upload` with the FULL base64 string(s) from state
-- If the user is NOT asking for medical analysis (selfie, casual question, "what's in this picture?") → describe the image using your own vision capability and answer directly
+- If the user is asking for CLINICAL / MEDICAL analysis:
+  1. FIRST, call the tool: `analyze_medical_image_upload(prompt=<user's question>)`
+  2. THEN, after the tool has been called, output the text: "Your request is being processed by our medical imaging agent. The analysis will appear momentarily ✨"
+
+- If the user is NOT asking for medical analysis (selfie, casual question, "what's in this picture?") → describe the image using your own vision capability and answer directly.
 
 After calling either analysis tool:
-→ The tool will implicitly trigger the medical analysis stream.
-→ Do NOT repeat the tool output or the signal.
-→ IMMEDIATELY say: "Your request is being processed by our medical imaging agent. The analysis will appear momentarily ✨"
-→ Do NOT add any other text, explanation, or filler.
+- The tool will return a signal string. DO NOT output this signal string to the user.
+- JUST say: "Your request is being processed by our medical imaging agent. The analysis will appear momentarily ✨"
 
 ## Critical rules
 - Always maintain conversation context and remember previous turns.

@@ -77,27 +77,13 @@ async def root():
 @app.websocket("/ws/analyze")
 async def analyze_proxy(websocket: WebSocket) -> None:
     """WebSocket proxy — streams tokens from the Colab medical AI server.
-
-    Handles ALL scenarios:
-      1) Text-only prompt            → /ws/analyze/text
-      2) Image URL + prompt          → /ws/analyze/image-url
-      3) Image upload (base64)       → /ws/analyze/image-base64
-      Mixed / multi-image            → /ws/analyze/unified
-
-    JSON payload (all image fields optional):
-    {
-      "prompt":       "...",
-      "max_new_tokens": 500,
-      "image_url":    "https://...",
-      "image_url_2":  "https://...",
-      "image_b64":    "<base64>",
-      "image_b64_2":  "<base64>"
-    }
     """
     await websocket.accept()
+    logger.info("[analyze_proxy] Client connected to /ws/analyze")
 
     try:
         request_data = await websocket.receive_text()
+        logger.info(f"[analyze_proxy] Received request data: {request_data[:200]}")
         request = json.loads(request_data)
 
         prompt         = request.get("prompt", "Describe this medical image in detail.")
@@ -115,6 +101,7 @@ async def analyze_proxy(websocket: WebSocket) -> None:
 
         colab_base_url = os.getenv("COLAB_BASE_URL", "")
         if not colab_base_url:
+            logger.error("[analyze_proxy] COLAB_BASE_URL not configured")
             await websocket.send_json({"error": "COLAB_BASE_URL is not configured."})
             await websocket.close()
             return
@@ -125,6 +112,7 @@ async def analyze_proxy(websocket: WebSocket) -> None:
             .replace("http://", "ws://")
             .rstrip("/")
         )
+        logger.info(f"[analyze_proxy] Connecting to Colab backend at: {ws_base}")
 
         has_b64  = bool(image_b64 or image_b64_2)
         has_url  = bool(image_url or image_url_2)
@@ -159,42 +147,63 @@ async def analyze_proxy(websocket: WebSocket) -> None:
         
         logger.info(f"[analyze_proxy] Connecting to {endpoint} w/ headers...")
         
-        # Determine strict header argument based on websockets version or trial
-        # For newer websockets (13+), additional_headers might be preferred or extra_headers
-        # But if extra_headers is failing at create_connection, it means it's being passed as a kwarg to the loop
-        # We will try 'additional_headers' if available, or just pass headers in the standard way
-        
-        connection_args = {
-            "ping_interval": None,
-            "max_size": None
-        }
-        
-        # Try to use 'additional_headers' which is often the safe way to pass headers in newer libs
-        # without them being passed to create_connection
-        async with websockets.connect(
-            endpoint, 
-            additional_headers=extra_headers,
-            **connection_args
-        ) as colab_ws:
-            logger.info("[analyze_proxy] Connected to Colab backend!")
-            await colab_ws.send(json.dumps(payload))
-            async for message in colab_ws:
-                data = json.loads(message)
-                if "token" in data:
-                    await websocket.send_json({"token": data["token"]})
-                elif data.get("status") == "done":
-                    await websocket.send_json({"status": "done"})
-                    break
-                elif "error" in data:
-                    await websocket.send_json({"error": data["error"]})
-                    break
+        # Try to connect to Collab
+        endpoint_url = endpoint # Store for error message
+        try:
+             logger.info(f"[analyze_proxy] Attempting connection to {endpoint} with headers: {extra_headers}")
+             async with websockets.connect(
+                endpoint, 
+                extra_headers=extra_headers,
+                ping_interval=None,
+                max_size=None,
+                open_timeout=10, # Add timeout to prevent indefinite hanging
+            ) as colab_ws:
+                logger.info("[analyze_proxy] Connected to Colab backend!")
+                logger.info(f"[analyze_proxy] Sending payload: {json.dumps(payload)[:100]}...")
+                await colab_ws.send(json.dumps(payload))
+                logger.info("[analyze_proxy] Payload sent, waiting for messages...")
+                
+                async for message in colab_ws:
+                    # Optimize: send raw message to client immediately to reduce latency
+                    await websocket.send_text(message)
+                    
+                    # Quick check for termination conditions without full parse
+                    if '"status": "done"' in message or '"status":"done"' in message:
+                        break
+                    if '"error":' in message:
+                        break
+                logger.info("[analyze_proxy] Stream finished normally")
+
+        except TypeError:
+             # Fallback for newer websockets that might not accept extra_headers as kwarg 
+             # (though usually they do specific handling, let's try additional_headers if checking version)
+             # But actually, passing it in strict format for modern websockets:
+             logger.warning("[analyze_proxy] TypeError connecting with extra_headers, retrying with additional_headers...")
+             async with websockets.connect(
+                endpoint, 
+                additional_headers=extra_headers,
+                ping_interval=None,
+                max_size=None,
+                open_timeout=10,
+            ) as colab_ws:
+                logger.info("[analyze_proxy] Connected to Colab backend (retry)!")
+                await colab_ws.send(json.dumps(payload))
+                async for message in colab_ws:
+                    # Optimize: send raw message to client immediately to reduce latency
+                    await websocket.send_text(message)
+                    
+                    if '"status": "done"' in message or '"status":"done"' in message:
+                        break
+                    if '"error":' in message:
+                        break
+                logger.info("[analyze_proxy] Stream finished normally (retry)")
 
     except WebSocketDisconnect:
         logger.debug("[analyze_proxy] Client disconnected")
     except Exception as e:
-        logger.error(f"[analyze_proxy] Error: {e}", exc_info=True)
+        logger.error(f"[analyze_proxy] Error connecting to {endpoint_url}: {e}", exc_info=True)
         try:
-            await websocket.send_json({"error": str(e)})
+            await websocket.send_json({"error": f"Failed to reach Collab backend: {str(e)}"})
         except Exception:
             pass
     finally:
@@ -268,13 +277,21 @@ def _extract_signal(event_json: str) -> tuple[str | None, str]:
                 modified = True
                 found_in_this_part = True
                 logger.info(f"[SIGNAL] Found in text part. Payload: {signal_payload[:60]}")
-            else:
-                # Fallback: take everything after prefix if JSON parsing fails here
-                # (downstream task might still try to parse it, but text is lost)
+                # Found signal in this part, no need to continue parsing this part
+                # break is not needed here as we use found_in_this_part flag
+            
+            if not found_in_this_part and _SIGNAL_PREFIX in text:
+                # Fallback: take everything after prefix if structured extraction fails
+                prefix_idx = text.index(_SIGNAL_PREFIX)
+                raw_payload = text[prefix_idx + len(_SIGNAL_PREFIX):]
+                
                 signal_payload = raw_payload.strip()
                 cleaned_text = text[:prefix_idx].strip()
                 if cleaned_text:
                     new_parts.append({**part, "text": cleaned_text})
+                else:
+                    new_parts.append({**part, "text": " "}) # Preserve empty part to avoid validation errors
+
                 modified = True
                 found_in_this_part = True
                 logger.info(f"[SIGNAL] Found in text part (fallback). Payload starts: {signal_payload[:60]}")
@@ -466,6 +483,11 @@ async def websocket_endpoint(
                 run_config=run_config,
             ):
                 event_json = event.model_dump_json(exclude_none=True, by_alias=True)
+                
+                # LOGGING: Write full event to a separate debug file for inspection
+                with open("adk_events_debug.log", "a", encoding="utf-8") as f:
+                    f.write(f"\n--- EVENT {event.timestamp} ---\n{event_json}\n")
+
                 # Log the full event at INFO so we can see tool responses in the console
                 logger.info(f"[ADK EVENT] {event_json[:500]}")
 
