@@ -298,11 +298,21 @@ async def websocket_endpoint(
                         f"type: {mime_type}"
                     )
 
-                    # Send image as blob
-                    image_blob = types.Blob(
-                        mime_type=mime_type, data=image_data
+                    # Send image as Content so text-mode models can see it
+                    content = types.Content(
+                        parts=[
+                            types.Part(
+                                inline_data=types.Blob(
+                                    mime_type=mime_type,
+                                    data=image_data,
+                                )
+                            ),
+                            types.Part(
+                                text="The user has shared an image. Please analyze and describe what you see."
+                            ),
+                        ]
                     )
-                    live_request_queue.send_realtime(image_blob)
+                    live_request_queue.send_content(content)
 
     async def downstream_task() -> None:
         """Receives Events from run_live() and sends to WebSocket."""
