@@ -5,7 +5,7 @@ import threading
 import asyncio
 import requests
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List
 
 import torch
 from PIL import Image
@@ -96,10 +96,19 @@ class ImageURLRequest(BaseModel):
 
 
 # ── Shared input builder ──────────────────────────────────────
+# Accepts either a single Optional[Image] or a List[Image] for multi-image.
 
-def build_inputs(model, processor, image: Optional[Image.Image], prompt: str):
+def build_inputs(model, processor, image_or_images, prompt: str):
+    # Normalise to a clean list of PIL images
+    if image_or_images is None:
+        images: List[Image.Image] = []
+    elif isinstance(image_or_images, list):
+        images = [img for img in image_or_images if img is not None]
+    else:
+        images = [image_or_images]
+
     content = []
-    if image:
+    for _ in images:
         content.append({"type": "image"})
     content.append({"type": "text", "text": prompt})
     messages = [{"role": "user", "content": content}]
@@ -107,8 +116,8 @@ def build_inputs(model, processor, image: Optional[Image.Image], prompt: str):
     text_input = processor.apply_chat_template(
         messages, add_generation_prompt=True, tokenize=False
     )
-    if image:
-        inputs = processor(text=text_input, images=image, return_tensors="pt")
+    if images:
+        inputs = processor(text=text_input, images=images, return_tensors="pt")
     else:
         inputs = processor(text=text_input, return_tensors="pt")
 
@@ -407,6 +416,99 @@ async def ws_analyze_image_base64(websocket: WebSocket):
 
     except WebSocketDisconnect:
         print("[SERVER] ⚠️  Client disconnected /ws/image-base64", flush=True)
+    except Exception as e:
+        print(f"[SERVER] ❌ {e}", flush=True)
+        try:
+            await websocket.send_json({"error": str(e)})
+        except Exception:
+            pass
+
+
+# ── NEW: Unified WebSocket endpoint ─────────────────────────────────────────
+# Handles ALL three scenarios in a single endpoint:
+#
+#   Scenario 1 — text-only prompt (no images)
+#   Scenario 2 — image URL(s) + prompt          (up to 2 URLs)
+#   Scenario 3 — image upload(s) as base64 + optional URL + prompt
+#
+# JSON payload (all image fields are optional):
+# {
+#   "prompt":       "...",
+#   "max_new_tokens": 500,
+#   "image_url":    "https://...",   <- first image URL
+#   "image_url_2":  "https://...",   <- second image URL
+#   "image_b64":    "<base64>",      <- first uploaded file
+#   "image_b64_2":  "<base64>"       <- second uploaded file
+# }
+# Total images accepted: at most 2 (b64 images take priority over URL images).
+
+@app.websocket("/ws/analyze/unified")
+async def ws_analyze_unified(websocket: WebSocket):
+    await websocket.accept()
+    print("[SERVER] 🔌 WS /unified connected", flush=True)
+    try:
+        data = await websocket.receive_json()
+
+        prompt        = data.get("prompt",        "Describe this medical image. What do you see?")
+        max_new_tokens= int(data.get("max_new_tokens", 500))
+        image_url     = data.get("image_url",     "")
+        image_url_2   = data.get("image_url_2",   "")
+        image_b64     = data.get("image_b64",     "")
+        image_b64_2   = data.get("image_b64_2",   "")
+
+        print(
+            f"[SERVER] 📩 unified prompt={prompt[:60]!r} "
+            f"url1={'yes' if image_url else 'no'} url2={'yes' if image_url_2 else 'no'} "
+            f"b64_1={'yes' if image_b64 else 'no'} b64_2={'yes' if image_b64_2 else 'no'}",
+            flush=True,
+        )
+
+        if "model" not in MODEL_CACHE:
+            await websocket.send_json({"error": "Model is not loaded yet."})
+            await websocket.close()
+            return
+
+        images: List[Image.Image] = []
+
+        # 1. Load base64-uploaded images first (user-uploaded files take priority)
+        for b64_str in [image_b64, image_b64_2]:
+            if b64_str and len(images) < 2:
+                try:
+                    img = Image.open(io.BytesIO(base64.b64decode(b64_str))).convert("RGB")
+                    images.append(img)
+                    print(f"[SERVER] 🖼️  Loaded b64 image: {img.size}", flush=True)
+                except Exception as exc:
+                    print(f"[SERVER] ⚠️  Bad b64 image: {exc}", flush=True)
+                    await websocket.send_json({"error": f"Invalid base64 image: {exc}"})
+                    return
+
+        # 2. Load URL images into remaining slots
+        for url in [image_url, image_url_2]:
+            if url and len(images) < 2:
+                try:
+                    resp = requests.get(url, headers={"User-Agent": "CuraNova"}, stream=True, timeout=15)
+                    resp.raise_for_status()
+                    img = Image.open(resp.raw).convert("RGB")
+                    images.append(img)
+                    print(f"[SERVER] 🖼️  Loaded URL image: {img.size}", flush=True)
+                except Exception as exc:
+                    print(f"[SERVER] ⚠️  Failed URL image {url!r}: {exc}", flush=True)
+                    await websocket.send_json({"error": f"Failed to fetch image URL: {exc}"})
+                    return
+
+        print(f"[SERVER] 🏃 Running inference with {len(images)} image(s)", flush=True)
+
+        sent = 0
+        async for token in run_inference_streaming_async(images if images else None, prompt, max_new_tokens):
+            await websocket.send_json({"token": token})
+            sent += 1
+            await asyncio.sleep(0)
+
+        print(f"[SERVER] ✅ Sent {sent} token messages.", flush=True)
+        await websocket.send_json({"status": "done"})
+
+    except WebSocketDisconnect:
+        print("[SERVER] ⚠️  Client disconnected /ws/unified", flush=True)
     except Exception as e:
         print(f"[SERVER] ❌ {e}", flush=True)
         try:
