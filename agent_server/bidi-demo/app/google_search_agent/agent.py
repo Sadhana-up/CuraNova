@@ -10,25 +10,33 @@ When the agent decides to run a medical analysis tool, the tool:
   1. Immediately returns a JSON "signal" string that tells main.py to push a
      special `medical_stream_trigger` event to the Next.js client.
   2. The Next.js client receives that event and opens its own direct WebSocket
-     to /ws/analyze, streaming tokens into the green "Medical Analysis" bubble —
-     exactly as before, but now fully under agent control.
+     to /ws/analyze, streaming tokens into the green "Medical Analysis" bubble.
 
 The agent keeps full conversation context (memory) throughout.
+
+Callback flow (no duplicate messages):
+  before_tool_callback  → sets _medical_tool_called flag in state
+  [tool runs]           → returns __MEDICAL_STREAM__:... signal (main.py grabs it)
+  after_model_callback  → sees flag, REPLACES whatever LLM generated with one
+                          static acknowledgement line, then clears flag.
+
+  The system instruction intentionally does NOT tell the LLM what to say after
+  a tool call — the after_model_callback owns that response entirely.
+  This is why the message appears exactly once.
 """
 
 import base64
 import json
 import os
-import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
 
 from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.tools.tool_context import ToolContext
-from google.adk.tools.base_tool import BaseTool          # ← NEW
+from google.adk.tools.base_tool import BaseTool
 from google.adk.models.llm_request import LlmRequest
-from google.adk.models.llm_response import LlmResponse   # ← NEW
+from google.adk.models.llm_response import LlmResponse
 from google.genai import types as genai_types
 from dotenv import load_dotenv
 
@@ -37,65 +45,71 @@ load_dotenv()
 print("LOADING AGENT.PY MODULE...")
 
 # ──────────────────────────────────────────────────────────────
-# SIGNAL PREFIX — main.py watches for this prefix in tool output
-# to know it must forward a medical_stream_trigger event.
+# Constants
 # ──────────────────────────────────────────────────────────────
 _SIGNAL_PREFIX = "__MEDICAL_STREAM__:"
-
-# Names of tools that trigger background medical analysis.
-# After these run, the LLM's own interpretation is redundant —
-# we replace it with a static acknowledgement.
 _MEDICAL_TOOL_NAMES = {"analyze_medical_image", "analyze_medical_image_upload"}
-
-# State key used to communicate between the two new callbacks.
 _FLAG_KEY = "_medical_tool_called"
 
+# The ONE place this text is defined.
+# Only after_model_callback emits it — never the LLM itself.
+_ACK_MESSAGE = (
+    "Your request is being processed by our medical imaging agent. "
+    "The analysis will appear momentarily ✨"
+)
+
+
+# ──────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────
 def debug_log(msg: str):
-    import datetime
-    import sys
+    import datetime, sys
     try:
-        with open("d:\\curanova\\agent_server\\bidi-demo\\app\\google_search_agent\\debug_callback.log", "a") as f:
+        with open(
+            "d:\\curanova\\agent_server\\bidi-demo\\app\\google_search_agent\\debug_callback.log",
+            "a",
+        ) as f:
             f.write(f"{datetime.datetime.now()} - {msg}\n")
     except Exception as e:
         print(f"Failed to write to log file: {e}")
     print(msg)
     sys.stdout.flush()
 
+
 def log_tool_usage(tool_name: str, args: dict):
     import datetime
     try:
         log_path = "d:\\curanova\\agent_server\\bidi-demo\\app\\google_search_agent\\tool_usage.log"
         timestamp = datetime.datetime.now().isoformat()
-        log_entry = f"[{timestamp}] Tool: {tool_name} | Args: {json.dumps(args, default=str)}\n"
+        entry = f"[{timestamp}] Tool: {tool_name} | Args: {json.dumps(args, default=str)}\n"
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(log_entry)
-        print(f"TOOL_LOG: {log_entry.strip()}")
+            f.write(entry)
+        print(f"TOOL_LOG: {entry.strip()}")
     except Exception as e:
         print(f"Failed to log tool usage: {e}")
 
 
 # ──────────────────────────────────────────────────────────────
-# Tool 1: Trigger analysis via public image URL
+# Tool 1 — Public image URL analysis
 # ──────────────────────────────────────────────────────────────
 def analyze_medical_image(image_url: str, prompt: str) -> str:
     """Triggers the CuraNova medical AI to analyse a medical image given its
     public URL.
 
-    Call this tool whenever the user provides a direct image URL
-    (starting with http:// or https://) AND asks for a clinical or medical
-    analysis of that image.
+    Use this tool when:
+    - The user has provided a direct image URL (http:// or https://)
+    - AND they are asking for a clinical or medical analysis of that image.
 
-    Do NOT call this tool for general image descriptions or non-medical
-    questions — answer those directly.
+    Do NOT use this tool for general image descriptions, non-medical questions,
+    or when no URL has been provided — answer those directly.
 
     Args:
-        image_url: The publicly accessible URL of the medical image.
-        prompt: The clinical question or instruction for the analysis.
+        image_url: Publicly accessible URL of the medical image.
+        prompt:    The clinical question or instruction for the analysis.
 
     Returns:
-        A signal string that the backend uses to stream the analysis to the
-        client. After this call, tell the user their request is being
-        processed by the medical agent.
+        An internal signal string consumed by the backend. The backend streams
+        the actual analysis directly to the user — you do not relay the result.
     """
     log_tool_usage("analyze_medical_image", {"image_url": image_url, "prompt": prompt})
     payload = {"image_url": image_url, "prompt": prompt, "max_new_tokens": 500}
@@ -103,67 +117,72 @@ def analyze_medical_image(image_url: str, prompt: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
-# Tool 2: Trigger analysis for uploaded image(s)
+# Tool 2 — Uploaded image analysis
 # ──────────────────────────────────────────────────────────────
 def analyze_medical_image_upload(
     prompt: str,
     tool_context: ToolContext,
     session_id: Optional[str] = None,
 ) -> str:
-    """Triggers the CuraNova medical AI to analyse one or two uploaded images.  
+    """Triggers the CuraNova medical AI to analyse one or two uploaded images.
 
-    Call this tool ONLY when:
-      - The user has uploaded an image (and the directive says so), AND
-      - The user is asking for a clinical / medical analysis of that image.     
+    Use this tool when:
+    - The user has uploaded an image via the camera or file picker
+      (the directive you receive will explicitly say so)
+    - AND they are asking for a clinical or medical analysis.
 
-    The actual image data is retrieved from session state automatically. 
-    If for some reason session state fails, it will attempt to read from a fallback file using session_id.       
+    Do NOT use this tool for:
+    - Selfies, casual photos, "what's in this picture?" → describe it yourself.
+    - When no image has been uploaded yet → wait for the upload.
+
+    Image data is retrieved automatically from session state (and a fallback
+    file if needed). You never need to pass raw image bytes yourself.
 
     Args:
-        prompt: The clinical question or instruction from the user.
-        session_id: The session ID provided by the user context (if available).
+        prompt:     The clinical question or instruction from the user.
+        session_id: The session ID from the directive (used for fallback lookup).
 
     Returns:
-        A signal string for the backend streaming mechanism.
+        An internal signal string consumed by the backend. The backend streams
+        the actual analysis directly to the user — you do not relay the result.
     """
-    debug_log(f"DEBUG: [analyze_medical_image_upload] Called with prompt='{prompt}', session_id='{session_id}'")
-    log_tool_usage("analyze_medical_image_upload", {
-        "prompt": prompt,
-        "session_id": session_id,
-        "note": "Image data retrieved from session state or fallback file"
-    })
+    debug_log(
+        f"DEBUG: [analyze_medical_image_upload] prompt='{prompt}', session_id='{session_id}'"
+    )
+    log_tool_usage(
+        "analyze_medical_image_upload",
+        {"prompt": prompt, "session_id": session_id, "note": "image from state/fallback"},
+    )
 
     images_b64 = tool_context.state.get("uploaded_images_b64", [])
 
     if images_b64:
-        debug_log(f"DEBUG: [analyze_medical_image_upload] PRIMARY SUCCESS: Found {len(images_b64)} images in session state memory.")
+        debug_log(f"DEBUG: PRIMARY: {len(images_b64)} images from state.")
     else:
-        debug_log("DEBUG: [analyze_medical_image_upload] PRIMARY FAIL: Session state empty.")
+        debug_log("DEBUG: PRIMARY FAIL: state empty.")
 
     if not images_b64 and session_id:
-        debug_log(f"DEBUG: [analyze_medical_image_upload] Checking fallback file for session {session_id}...")
+        debug_log(f"DEBUG: Trying fallback file for session {session_id}…")
         try:
-            fallback_path = Path("d:/curanova/uploaded_images") / f"{session_id}.json"
-            if fallback_path.exists():
-                with open(fallback_path, "r", encoding="utf-8") as f:
+            path = Path("d:/curanova/uploaded_images") / f"{session_id}.json"
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    if isinstance(data, list) and len(data) > 0:
-                        images_b64 = data
-                        debug_log(f"DEBUG: [analyze_medical_image_upload] Loaded {len(images_b64)} images from fallback file.")
+                if isinstance(data, list) and data:
+                    images_b64 = data
+                    debug_log(f"DEBUG: Loaded {len(images_b64)} images from fallback.")
             else:
-                debug_log(f"DEBUG: [analyze_medical_image_upload] Fallback file not found: {fallback_path}")
+                debug_log(f"DEBUG: Fallback file not found: {path}")
         except Exception as e:
-            debug_log(f"DEBUG: [analyze_medical_image_upload] Error reading fallback file: {e}")
+            debug_log(f"DEBUG: Error reading fallback: {e}")
 
     if not images_b64:
-        debug_log("DEBUG: [analyze_medical_image_upload] ERROR: No uploaded images found.")
+        debug_log("DEBUG: ERROR — no images found anywhere.")
         return "ERROR: No uploaded images found. Please try uploading again."
 
-    debug_log(f"DEBUG: [analyze_medical_image_upload] SUCCESS! Found {len(images_b64)} images.")
-    for idx, img in enumerate(images_b64):
-        img_len = len(img) if img else 0
-        img_preview = img[:30] + "..." if img_len > 30 else "check data"
-        debug_log(f"DEBUG: [analyze_medical_image_upload] Image {idx+1}: Length={img_len} chars | Preview={img_preview}")
+    debug_log(f"DEBUG: SUCCESS — {len(images_b64)} images ready.")
+    for i, img in enumerate(images_b64):
+        debug_log(f"DEBUG: Image {i+1}: len={len(img)}, preview={img[:30]}…")
 
     payload: dict = {"image_b64": images_b64[0], "prompt": prompt, "max_new_tokens": 500}
     if len(images_b64) > 1:
@@ -173,59 +192,46 @@ def analyze_medical_image_upload(
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# NEW CALLBACK 1: before_tool_callback
+# Callback A — before_tool_callback
 #
-# Fires just before any tool runs.
-# When a medical analysis tool is about to execute, we plant a flag
-# in session state so the after_model_callback knows to intercept
-# the LLM's follow-up interpretation.
+# Fires just before ANY tool runs.
+# For medical tools: plant a state flag so after_model_callback
+# knows to intercept the LLM's follow-up text generation.
+# Always returns None — the tool must still run so main.py can
+# capture the __MEDICAL_STREAM__ signal from its output.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def before_tool_callback(
     tool: BaseTool,
     args: Dict[str, Any],
     tool_context: ToolContext,
 ) -> Optional[Dict]:
-    """
-    Intercept point: fires before every tool call.
-
-    For medical analysis tools, we set a state flag so the
-    after_model_callback can replace the LLM's redundant text
-    interpretation with a single static acknowledgement line.
-
-    Returns None always — we never want to skip the tool itself here,
-    because main.py needs the signal string the tool returns.
-    """
-    tool_name = tool.name
-    if tool_name in _MEDICAL_TOOL_NAMES:
-        debug_log(f"[before_tool_callback] Medical tool '{tool_name}' is about to run — setting flag.")
+    if tool.name in _MEDICAL_TOOL_NAMES:
+        debug_log(f"[before_tool_callback] Medical tool '{tool.name}' — setting flag.")
         tool_context.state[_FLAG_KEY] = True
-    return None  # Always let the tool execute normally
+    return None  # Always let the tool execute
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# NEW CALLBACK 2: after_model_callback_handler
+# Callback B — after_model_callback
 #
-# Fires after every LLM generation.
-# When the flag is present AND the LLM just produced a plain text
-# response (i.e. its interpretation of the tool result), we replace
-# that text with a single static acknowledgement and clear the flag.
+# Fires after EVERY LLM generation.
 #
-# We leave function_call responses untouched — those are the LLM
-# deciding TO call a tool, which is fine and needed.
+# Two cases when flag is set:
+#   a) function_call parts  → LLM is deciding to call the tool.
+#      Must pass through untouched so the tool actually runs.
+#
+#   b) text parts           → LLM generated its follow-up text
+#      after the tool result arrived. We REPLACE it entirely with
+#      _ACK_MESSAGE and clear the flag.
+#
+# WHY THERE IS NO DUPLICATE:
+#   The system instruction never asks the LLM to say the ACK text.
+#   This callback is the sole source of that message → exactly once.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def after_model_callback_handler(
+def after_model_callback(
     callback_context: CallbackContext,
     llm_response: LlmResponse,
 ) -> Optional[LlmResponse]:
-    """
-    Intercept point: fires after every LLM generation.
-
-    If a medical tool was just called (flag is set) and the LLM has now
-    produced a plain text response (its interpretation of the tool result),
-    replace that response with a concise static acknowledgement.
-
-    Function-call responses are left untouched so the tool still executes.
-    """
     if not callback_context.state.get(_FLAG_KEY):
         return None  # Not a medical tool turn — do nothing
 
@@ -234,27 +240,23 @@ def after_model_callback_handler(
         return None
 
     parts = content.parts
-
     has_function_call = any(getattr(p, "function_call", None) for p in parts)
     has_text          = any(getattr(p, "text", None) for p in parts)
 
     if has_function_call:
-        # This is the LLM deciding to call the tool — let it through untouched.
-        debug_log("[after_model_callback] Function call response — not intercepting.")
+        # LLM is deciding to call the tool — must pass through untouched
+        debug_log("[after_model_callback] function_call → not intercepting.")
         return None
 
     if has_text:
-        # This is the LLM's interpretation AFTER the tool ran — replace it.
-        debug_log("[after_model_callback] Replacing LLM interpretation with static acknowledgement.")
+        # LLM generated its interpretation after the tool ran — replace it
+        debug_log("[after_model_callback] text response → replacing with ACK.")
         callback_context.state[_FLAG_KEY] = False  # Clear flag
 
         return LlmResponse(
             content=genai_types.Content(
                 role="model",
-                parts=[genai_types.Part(
-                    text="Your request is being processed by our medical imaging agent. "
-                         "The analysis will appear momentarily ✨"
-                )],
+                parts=[genai_types.Part(text=_ACK_MESSAGE)],
             )
         )
 
@@ -262,89 +264,50 @@ def after_model_callback_handler(
 
 
 # ──────────────────────────────────────────────────────────────
-# Before-model callback — intercept uploaded images
-# (unchanged from original)
+# before_model_callback — intercept uploaded images (fallback)
+# Main.py handles image injection directly for reliability in
+# streaming mode. This callback is kept as a safety net.
 # ──────────────────────────────────────────────────────────────
 async def before_model_callback(
     callback_context: CallbackContext,
     llm_request: LlmRequest,
 ) -> None:
-    """Detect inline image uploads and expose base64 data to the agent via
-    a text directive — the agent then decides whether to call a tool.
-    
-    NOTE: As of Feb 2026, image processing has moved to main.py for reliability.
-    This callback is kept as a fallback or for debugging purposes.
-    """
     debug_log("DEBUG: [before_model_callback] ENTERED")
     try:
         if not llm_request.contents:
-            debug_log("DEBUG: [before_model_callback] No contents in llm_request")
             return None
 
-        debug_log(f"DEBUG: [before_model_callback] Contents count: {len(llm_request.contents)}")
-
         last_user_content = None
-        if llm_request.contents:
-            for content in reversed(llm_request.contents):
-                role = getattr(content, "role", "unknown")
-                debug_log(f"DEBUG: [before_model_callback] Checking content with role: {role}")
-                if role == "user":
-                    last_user_content = content
-                    break
-
+        for content in reversed(llm_request.contents):
+            if getattr(content, "role", "") == "user":
+                last_user_content = content
+                break
+        if not last_user_content and llm_request.contents:
+            last_user_content = llm_request.contents[-1]
         if not last_user_content:
-            debug_log("DEBUG: [before_model_callback] No user content found in llm_request.")
-            if llm_request.contents:
-                debug_log(f"DEBUG: [before_model_callback] Contents available: {len(llm_request.contents)}")
-                last_user_content = llm_request.contents[-1]
-                debug_log(f"DEBUG: [before_model_callback] Inspecting last content (role={getattr(last_user_content, 'role', 'unknown')})")
-            else:
-                return None
+            return None
 
         parts = getattr(last_user_content, "parts", []) or []
         images_b64: list[str] = []
         text_parts: list[str] = []
 
-        debug_log(f"DEBUG: [before_model_callback] Processing {len(parts)} parts")
-
-        for i, part in enumerate(parts):
-            debug_log(f"DEBUG: [before_model_callback] Inspecting part {i}")
+        for part in parts:
             inline = getattr(part, "inline_data", None) or getattr(part, "inlineData", None)
-
-            if not inline:
-                debug_log(f"DEBUG: [before_model_callback] Part {i} has no direct inline_data attribute")
-                if hasattr(part, "to_dict"):
-                    d = part.to_dict()
-                    debug_log(f"DEBUG: [before_model_callback] Part {i} as dict keys: {d.keys()}")
-                    if "inline_data" in d:
-                        debug_log(f"DEBUG: [before_model_callback] Found inline_data in dict, likely a serialization issue if getattr failed")
-
             if inline:
                 mime_type = getattr(inline, "mime_type", "") or getattr(inline, "mimeType", "")
-                if not mime_type and hasattr(inline, "mime_type"):
-                    mime_type = inline.mime_type
-
-                debug_log(f"DEBUG: [before_model_callback] Found inline data with mime_type: {mime_type}")
-
                 if mime_type.startswith("image/"):
                     raw = getattr(inline, "data", b"")
                     if isinstance(raw, (bytes, bytearray)):
-                        b64_str = base64.b64encode(raw).decode("utf-8")
-                        images_b64.append(b64_str)
-                        debug_log(f"DEBUG: [before_model_callback] Encoded image (len={len(b64_str)})")
+                        images_b64.append(base64.b64encode(raw).decode("utf-8"))
                     elif isinstance(raw, str):
                         images_b64.append(raw)
-                        debug_log(f"DEBUG: [before_model_callback] Found string image data (len={len(raw)})")
-
-            text_content = getattr(part, "text", "")
-            if text_content:
-                text_parts.append(text_content)
+            text = getattr(part, "text", "")
+            if text:
+                text_parts.append(text)
 
         if not images_b64:
-            debug_log(f"DEBUG: [before_model_callback] No images found in parts (Total parts: {len(parts)})")
             return None
 
-        debug_log(f"DEBUG: [before_model_callback] Found {len(images_b64)} images. Storing in state...")
         images_b64 = images_b64[:2]
         prompt = " ".join(text_parts).strip()
 
@@ -352,18 +315,12 @@ async def before_model_callback(
         callback_context.state["uploaded_image_count"] = len(images_b64)
         callback_context.state["upload_prompt"] = prompt
 
-        debug_log(f"DEBUG: [before_model_callback] State updated with {len(images_b64)} images.")
-
-        if "Decide: does this image require a CLINICAL / MEDICAL analysis?" in prompt:
-            debug_log("DEBUG: [before_model_callback] Detected existing directive. Letting it pass through with image.")
-            return None
-
+        debug_log(f"DEBUG: [before_model_callback] Stored {len(images_b64)} images in state.")
         return None
 
     except Exception as e:
         import traceback
-        debug_log(f"ERROR inside before_model_callback: {e}")
-        debug_log(traceback.format_exc())
+        debug_log(f"ERROR inside before_model_callback: {e}\n{traceback.format_exc()}")
         return None
 
 
@@ -373,47 +330,77 @@ async def before_model_callback(
 agent = Agent(
     name="CuraNovaMedicalAgent",
     model=os.getenv("DEMO_AGENT_MODEL", "gemini-2.0-flash-exp"),
-    # ── Callbacks ───────────────────────────────────────────
     before_model_callback=before_model_callback,
-    before_tool_callback=before_tool_callback,           # ← NEW
-    after_model_callback=after_model_callback_handler,   # ← NEW
-    # ────────────────────────────────────────────────────────
-    instruction="""You are CuraNova, a specialized medical AI assistant with deep expertise in medical imaging and clinical knowledge.
+    before_tool_callback=before_tool_callback,
+    after_model_callback=after_model_callback,
+    instruction="""You are CuraNova, a specialized medical AI assistant with expertise in medical imaging and clinical knowledge. You have full memory of the conversation and always use previous context.
 
-You have full memory of the conversation. Always use previous context when answering.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+YOUR TWO TOOLS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-## Decision Framework
+1. analyze_medical_image(image_url, prompt)
+   PURPOSE  : Sends a publicly hosted image URL to the CuraNova medical AI for clinical analysis.
+   CALL WHEN: User provides a URL starting with http:// or https:// AND asks for clinical/medical analysis.
+   ARGS     :
+     • image_url — copy the URL exactly as the user provided it.
+     • prompt    — the user's clinical question or instruction.
+   RESULT   : Backend streams the full analysis to the user automatically. You output nothing extra.
 
-### Text-only questions (no images)
-Answer the user's medical or health questions directly, helpfully, and concisely.
-Always note that your responses are for educational purposes and NOT a substitute for professional medical advice.
+2. analyze_medical_image_upload(prompt, session_id)
+   PURPOSE  : Sends uploaded image(s) to the CuraNova medical AI for clinical analysis.
+   CALL WHEN: You receive a system directive confirming image(s) were uploaded AND the request is clinical/medical.
+   ARGS     :
+     • prompt     — the user's clinical question or instruction.
+     • session_id — copy this exactly from the directive you receive.
+   RESULT   : Tool retrieves image data from session state automatically (you never touch raw bytes).
+              Backend streams the full analysis to the user automatically. You output nothing extra.
 
-### Image URL in the message (e.g. https://...)
-If the user provides a direct image URL AND is asking for a clinical or medical analysis:
-1. FIRST, call the tool: `analyze_medical_image(image_url=<url>, prompt=<user's question>)`
-2. THEN, after the tool has been called, output the text: "Your request is being processed by our medical imaging agent. The analysis will appear momentarily ✨"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DECISION RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Do not describe your plan ("I will call the tool..."). just CALL IT.
+SCENARIO 1 — Text-only question, no image, no URL
+  → Answer directly using your medical knowledge.
+  → Note: for educational purposes only, not a substitute for professional advice.
 
-### Uploaded image(s) (via camera/file picker)
-The `before_model_callback` will inject a directive describing the uploaded images and asking you to decide.
+SCENARIO 2 — User provides image URL + asks for clinical/medical analysis
+  → Call analyze_medical_image(image_url=<url>, prompt=<question>) immediately.
+  → Do NOT narrate your plan. Do NOT say anything after calling the tool.
 
-Read the directive carefully:
-- If the user is asking for CLINICAL / MEDICAL analysis:
-  1. FIRST, call the tool: `analyze_medical_image_upload(prompt=<user's question>)`
-  2. THEN, after the tool has been called, output the text: "Your request is being processed by our medical imaging agent. The analysis will appear momentarily ✨"
+SCENARIO 3 — User provides image URL but does NOT ask for clinical analysis
+  → Do NOT call any tool. Answer the question using your own knowledge.
 
-- If the user is NOT asking for medical analysis (selfie, casual question, "what's in this picture?") → describe the image using your own vision capability and answer directly.
+SCENARIO 4 — Uploaded image(s) + clinical/medical analysis requested
+  → You will receive a directive like:
+      "The user sent N image(s) with this message: '<prompt>'
+       Decide: does this image require a CLINICAL / MEDICAL analysis?
+       - If YES → call analyze_medical_image_upload(prompt='...', session_id='...')
+       - If NO  → describe the image using your own vision capability."
+  → If clinical: call analyze_medical_image_upload immediately.
+  → Do NOT say anything after calling the tool.
 
-After calling either analysis tool:
-- The tool will return a signal string. DO NOT output this signal string to the user.
-- JUST say: "Your request is being processed by our medical imaging agent. The analysis will appear momentarily ✨"
+SCENARIO 5 — Uploaded image(s) but NOT a clinical request
+  (selfie, "what's in this photo?", casual questions)
+  → Do NOT call any tool. Use your vision capability to describe and respond normally.
 
-## Critical rules
-- Always maintain conversation context and remember previous turns.
-- After a tool call, briefly acknowledge and offer to answer follow-up questions.
-- Maximum 2 images per request.
-- Never truncate or modify the base64 strings when passing them to tools.
+SCENARIO 6 — User says they WILL upload an image (but hasn't yet)
+  → Do NOT call any tool. Do NOT assume an image is available.
+  → Reply: "Of course! Please go ahead and upload the image and I'll analyse it for you."
+  → Wait until you receive an upload directive before doing anything.
+
+SCENARIO 7 — User asks for medical image analysis but no image or URL provided
+  → Do NOT call any tool.
+  → Reply: "To perform a medical image analysis, please upload an image or provide a direct image URL."
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRITICAL RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• After calling EITHER tool — say NOTHING. The system automatically handles the response to the user.
+• NEVER output the raw return value of a tool (it begins with "__MEDICAL_STREAM__:" — never show this).
+• NEVER try to read or pass raw base64 image data yourself.
+• Maximum 2 images per request.
+• Always maintain conversation context. After analysis results appear (from a prior turn), answer follow-up questions using your medical knowledge.
 """,
     tools=[analyze_medical_image, analyze_medical_image_upload],
 )
