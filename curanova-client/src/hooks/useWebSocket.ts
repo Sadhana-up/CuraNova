@@ -1,7 +1,16 @@
 "use client";
 // ──────────────────────────────────────────────────────────
 // useWebSocket — manages the main ADK WebSocket connection.
-// Mirrors the connectWebsocket() logic from app.js exactly.
+//
+// New architecture:
+//   • ALL messages (text, URL, uploaded images) go through the
+//     main ADK WebSocket (/ws/{user_id}/{session_id}).
+//   • The Gemini agent decides whether a medical tool call is
+//     needed based on the message content.
+//   • When the agent calls a tool, it emits a medical_stream_trigger
+//     event. This hook catches that event and opens a direct
+//     WebSocket to /ws/analyze, streaming tokens into the green
+//     "Medical Analysis" bubble.
 // ──────────────────────────────────────────────────────────
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -14,7 +23,6 @@ import type {
 import {
   randomId,
   formatTimestamp,
-  extractImageUrl,
   cleanCJKSpaces,
   sanitizeEventForDisplay,
   base64ToArray,
@@ -33,7 +41,8 @@ interface UseWebSocketReturn {
   consoleEntries: ConsoleEntry[];
   connectionStatus: ConnectionStatus;
   sendTextMessage: (text: string) => void;
-  sendImage: (base64Data: string, imageDataUrl?: string) => void;
+  sendImage: (base64Data: string, imageDataUrl?: string, prompt?: string) => void;
+  sendImageUpload: (file: File, prompt?: string) => void;
   sendAudioChunk: (pcmData: ArrayBuffer) => void;
   clearConsole: () => void;
 }
@@ -117,10 +126,10 @@ export function useWebSocket({
     ]);
   }, []);
 
-  const addUserImageMessage = useCallback((imageDataUrl: string) => {
+  const addUserImageMessage = useCallback((imageDataUrl: string, prompt?: string) => {
     setMessages((prev) => [
       ...prev,
-      { id: randomId(), type: "image", text: "", imageDataUrl },
+      { id: randomId(), type: "image", text: prompt || "", imageDataUrl },
     ]);
   }, []);
 
@@ -148,7 +157,7 @@ export function useWebSocket({
     []
   );
 
-  // Update or create a tool-stream message
+  // Update or create a tool-stream message (green Medical Analysis bubble)
   const upsertToolStreamMessage = useCallback(
     (msgId: string, text: string, isPartial: boolean) => {
       setMessages((prev) => {
@@ -183,15 +192,22 @@ export function useWebSocket({
     );
   }, []);
 
-  // ── Direct analysis via /ws/analyze ──
+  // ── Direct analysis via /ws/analyze ──────────────────────────────────────
+  // Called when the agent emits a medical_stream_trigger event.
+  // payload matches the /ws/analyze JSON schema:
+  //   { prompt, image_url?, image_url_2?, image_b64?, image_b64_2?, max_new_tokens? }
   const startDirectAnalysis = useCallback(
-    (imageUrl: string, prompt: string) => {
-      const wsProtocol =
-        serverUrl.startsWith("https") ? "wss:" : "ws:";
+    (payload: {
+      prompt: string;
+      image_url?: string;
+      image_url_2?: string;
+      image_b64?: string;
+      image_b64_2?: string;
+      max_new_tokens?: number;
+    }) => {
+      const wsProtocol = serverUrl.startsWith("https") ? "wss:" : "ws:";
       const host = serverUrl.replace(/^https?:\/\//, "");
       const analyzeUrl = `${wsProtocol}//${host}/ws/analyze`;
-
-      addSystemMessage("Routing request to Colab medical model...");
 
       const streamId = randomId();
       analyzeStreamIdRef.current = streamId;
@@ -201,8 +217,8 @@ export function useWebSocket({
 
       addConsoleEntry(
         "outgoing",
-        "Direct Analysis Request",
-        { image_url: imageUrl, prompt, endpoint: analyzeUrl },
+        "Medical Stream Triggered",
+        { endpoint: analyzeUrl, ...payload },
         "🩺",
         "system"
       );
@@ -211,13 +227,7 @@ export function useWebSocket({
       analyzeWsRef.current = ws;
 
       ws.onopen = () => {
-        ws.send(
-          JSON.stringify({
-            image_url: imageUrl,
-            prompt,
-            max_new_tokens: 500,
-          })
-        );
+        ws.send(JSON.stringify({ max_new_tokens: 500, ...payload }));
       };
 
       ws.onmessage = (event) => {
@@ -225,24 +235,15 @@ export function useWebSocket({
 
         if (data.token) {
           analyzeStreamTextRef.current += data.token;
-          upsertToolStreamMessage(
-            streamId,
-            analyzeStreamTextRef.current,
-            true
-          );
+          upsertToolStreamMessage(streamId, analyzeStreamTextRef.current, true);
         } else if (data.status === "done") {
-          upsertToolStreamMessage(
-            streamId,
-            analyzeStreamTextRef.current,
-            false
-          );
+          upsertToolStreamMessage(streamId, analyzeStreamTextRef.current, false);
           addConsoleEntry(
             "incoming",
-            "Analysis Complete",
+            "Medical Analysis Complete",
             {
               tokens_received: analyzeStreamTextRef.current.length,
-              preview:
-                analyzeStreamTextRef.current.substring(0, 100) + "...",
+              preview: analyzeStreamTextRef.current.substring(0, 100) + "...",
             },
             "✅",
             "tool"
@@ -283,16 +284,12 @@ export function useWebSocket({
 
       ws.onclose = () => {
         if (analyzeStreamIdRef.current === streamId) {
-          upsertToolStreamMessage(
-            streamId,
-            analyzeStreamTextRef.current,
-            false
-          );
+          upsertToolStreamMessage(streamId, analyzeStreamTextRef.current, false);
         }
         analyzeWsRef.current = null;
       };
     },
-    [serverUrl, addSystemMessage, addConsoleEntry, upsertToolStreamMessage]
+    [serverUrl, addConsoleEntry, upsertToolStreamMessage]
   );
 
   // ── Build the main WebSocket URL ──
@@ -308,9 +305,32 @@ export function useWebSocket({
     return url;
   }, [serverUrl, enableProactivity, enableAffectiveDialog]);
 
-  // ── Handle incoming ADK event ──
+  // ── Handle incoming ADK event (or medical_stream_trigger) ──
   const handleAdkEvent = useCallback(
-    (adkEvent: AdkEvent) => {
+    (rawData: string) => {
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(rawData);
+      } catch {
+        return;
+      }
+
+      // ── Medical stream trigger from agent tool call ──────────────────────
+      if (parsed.medical_stream_trigger === true) {
+        const payload = parsed.payload as Parameters<typeof startDirectAnalysis>[0];
+        addConsoleEntry(
+          "incoming",
+          "Agent triggered medical analysis",
+          { payload },
+          "🩺",
+          "agent"
+        );
+        startDirectAnalysis(payload);
+        return;
+      }
+
+      const adkEvent = parsed as AdkEvent;
+
       // ── Build console summary ──
       let eventSummary = "Event";
       let eventEmoji = "📨";
@@ -337,37 +357,25 @@ export function useWebSocket({
       } else if (adkEvent.content?.parts) {
         const hasText = adkEvent.content.parts.some((p) => p.text);
         const hasAudio = adkEvent.content.parts.some((p) => p.inlineData);
-        const hasExecCode = adkEvent.content.parts.some(
-          (p) => p.executableCode
-        );
-        const hasCodeResult = adkEvent.content.parts.some(
-          (p) => p.codeExecutionResult
-        );
+        const hasExecCode = adkEvent.content.parts.some((p) => p.executableCode);
+        const hasCodeResult = adkEvent.content.parts.some((p) => p.codeExecutionResult);
 
         if (hasExecCode) {
           const cp = adkEvent.content.parts.find((p) => p.executableCode);
           if (cp?.executableCode) {
             const code = cp.executableCode.code || "";
             const lang = cp.executableCode.language || "unknown";
-            const trunc =
-              code.length > 60
-                ? code.substring(0, 60).replace(/\n/g, " ") + "..."
-                : code.replace(/\n/g, " ");
+            const trunc = code.length > 60 ? code.substring(0, 60).replace(/\n/g, " ") + "..." : code.replace(/\n/g, " ");
             eventSummary = `Executable Code (${lang}): ${trunc}`;
             eventEmoji = "💻";
           }
         }
         if (hasCodeResult) {
-          const rp = adkEvent.content.parts.find(
-            (p) => p.codeExecutionResult
-          );
+          const rp = adkEvent.content.parts.find((p) => p.codeExecutionResult);
           if (rp?.codeExecutionResult) {
             const outcome = rp.codeExecutionResult.outcome || "UNKNOWN";
             const output = rp.codeExecutionResult.output || "";
-            const truncOut =
-              output.length > 60
-                ? output.substring(0, 60).replace(/\n/g, " ") + "..."
-                : output.replace(/\n/g, " ");
+            const truncOut = output.length > 60 ? output.substring(0, 60).replace(/\n/g, " ") + "..." : output.replace(/\n/g, " ");
             eventSummary = `Code Execution Result (${outcome}): ${truncOut}`;
             eventEmoji = outcome === "OUTCOME_OK" ? "✅" : "❌";
           }
@@ -394,17 +402,8 @@ export function useWebSocket({
           }
           eventEmoji = "🔊";
 
-          const sanitized = sanitizeEventForDisplay(
-            adkEvent as unknown as Record<string, unknown>
-          );
-          addConsoleEntry(
-            "incoming",
-            eventSummary,
-            sanitized,
-            eventEmoji,
-            author,
-            true
-          );
+          const sanitized = sanitizeEventForDisplay(adkEvent as unknown as Record<string, unknown>);
+          addConsoleEntry("incoming", eventSummary, sanitized, eventEmoji, author, true);
         }
       }
 
@@ -413,9 +412,7 @@ export function useWebSocket({
         adkEvent.content?.parts?.some((p) => p.inlineData) &&
         !adkEvent.content?.parts?.some((p) => p.text);
       if (!isAudioOnly) {
-        const sanitized = sanitizeEventForDisplay(
-          adkEvent as unknown as Record<string, unknown>
-        );
+        const sanitized = sanitizeEventForDisplay(adkEvent as unknown as Record<string, unknown>);
         addConsoleEntry("incoming", eventSummary, sanitized, eventEmoji, author);
       }
 
@@ -437,9 +434,6 @@ export function useWebSocket({
 
       // ── Interrupted ──
       if (adkEvent.interrupted === true) {
-        if (onAudioDataRef.current) {
-          // Signal end of audio
-        }
         if (currentMessageIdRef.current) {
           markInterrupted(currentMessageIdRef.current);
         }
@@ -464,22 +458,15 @@ export function useWebSocket({
         if (!currentInputTranscriptionIdRef.current) {
           const id = randomId();
           currentInputTranscriptionIdRef.current = id;
-          currentInputTranscriptionTextRef.current =
-            cleanCJKSpaces(transcriptionText);
-          upsertAgentMessage(
-            id,
-            currentInputTranscriptionTextRef.current,
-            !isFinished,
-            { type: "user", isTranscription: true }
-          );
+          currentInputTranscriptionTextRef.current = cleanCJKSpaces(transcriptionText);
+          upsertAgentMessage(id, currentInputTranscriptionTextRef.current, !isFinished, {
+            type: "user",
+            isTranscription: true,
+          });
         } else {
-          if (
-            !currentOutputTranscriptionIdRef.current &&
-            !currentMessageIdRef.current
-          ) {
+          if (!currentOutputTranscriptionIdRef.current && !currentMessageIdRef.current) {
             if (isFinished) {
-              currentInputTranscriptionTextRef.current =
-                cleanCJKSpaces(transcriptionText);
+              currentInputTranscriptionTextRef.current = cleanCJKSpaces(transcriptionText);
             } else {
               currentInputTranscriptionTextRef.current = cleanCJKSpaces(
                 currentInputTranscriptionTextRef.current + transcriptionText
@@ -507,11 +494,7 @@ export function useWebSocket({
         const transcriptionText = adkEvent.outputTranscription.text;
         const isFinished = adkEvent.outputTranscription.finished;
 
-        // Finalize input transcription on first output
-        if (
-          currentInputTranscriptionIdRef.current &&
-          !currentOutputTranscriptionIdRef.current
-        ) {
+        if (currentInputTranscriptionIdRef.current && !currentOutputTranscriptionIdRef.current) {
           finalizeMessage(currentInputTranscriptionIdRef.current);
           currentInputTranscriptionIdRef.current = null;
           currentInputTranscriptionTextRef.current = "";
@@ -522,9 +505,7 @@ export function useWebSocket({
           const id = randomId();
           currentOutputTranscriptionIdRef.current = id;
           currentOutputTranscriptionTextRef.current = transcriptionText;
-          upsertAgentMessage(id, transcriptionText, !isFinished, {
-            isTranscription: true,
-          });
+          upsertAgentMessage(id, transcriptionText, !isFinished, { isTranscription: true });
         } else {
           if (isFinished) {
             currentOutputTranscriptionTextRef.current = transcriptionText;
@@ -548,7 +529,6 @@ export function useWebSocket({
 
       // ── Content events (text or audio) ──
       if (adkEvent.content?.parts) {
-        // Finalize input transcription on first content
         if (
           currentInputTranscriptionIdRef.current &&
           !currentMessageIdRef.current &&
@@ -565,9 +545,7 @@ export function useWebSocket({
           if (part.inlineData) {
             const mime = part.inlineData.mimeType || "";
             if (mime.startsWith("audio/pcm") && part.inlineData.data) {
-              onAudioDataRef.current?.(
-                base64ToArray(part.inlineData.data)
-              );
+              onAudioDataRef.current?.(base64ToArray(part.inlineData.data));
             }
           }
 
@@ -580,20 +558,16 @@ export function useWebSocket({
               upsertAgentMessage(id, part.text, true);
             } else {
               currentMessageTextRef.current += part.text;
-              upsertAgentMessage(
-                currentMessageIdRef.current,
-                currentMessageTextRef.current,
-                true
-              );
+              upsertAgentMessage(currentMessageIdRef.current, currentMessageTextRef.current, true);
             }
           }
         }
       }
     },
     [
+      startDirectAnalysis,
       addConsoleEntry,
       upsertAgentMessage,
-      upsertToolStreamMessage,
       finalizeMessage,
       markInterrupted,
     ]
@@ -613,18 +587,12 @@ export function useWebSocket({
     ws.onopen = () => {
       setConnectionStatus("connected");
       addSystemMessage("Connected to ADK streaming server");
-      addConsoleEntry(
-        "incoming",
-        "WebSocket Connected",
-        { userId, sessionId, url },
-        "🔌",
-        "system"
-      );
+      addConsoleEntry("incoming", "WebSocket Connected", { userId, sessionId, url }, "🔌", "system");
     };
 
     ws.onmessage = (event) => {
-      const adkEvent: AdkEvent = JSON.parse(event.data);
-      handleAdkEvent(adkEvent);
+      // Pass raw string so handleAdkEvent can detect medical_stream_trigger
+      handleAdkEvent(event.data);
     };
 
     ws.onclose = () => {
@@ -638,62 +606,44 @@ export function useWebSocket({
         "system"
       );
       reconnectTimerRef.current = setTimeout(() => {
-        addConsoleEntry(
-          "outgoing",
-          "Reconnecting to ADK server...",
-          { userId, sessionId },
-          "🔄",
-          "system"
-        );
+        addConsoleEntry("outgoing", "Reconnecting to ADK server...", { userId, sessionId }, "🔄", "system");
         connect();
       }, 5000);
     };
 
     ws.onerror = () => {
       setConnectionStatus("disconnected");
-      addConsoleEntry(
-        "error",
-        "WebSocket Error",
-        { message: "Connection error occurred" },
-        "⚠️",
-        "system"
-      );
+      addConsoleEntry("error", "WebSocket Error", { message: "Connection error occurred" }, "⚠️", "system");
     };
   }, [buildWsUrl, addSystemMessage, addConsoleEntry, handleAdkEvent]);
 
-  // ── Send text message ──
+  // ── Send text message (ALL text goes to agent, including URLs) ──
   const sendTextMessage = useCallback(
     (message: string) => {
       addUserMessage(message);
-
-      const imageUrl = extractImageUrl(message);
-      if (imageUrl) {
-        const prompt =
-          message.replace(imageUrl, "").trim() ||
-          "Describe this medical image in detail.";
-        startDirectAnalysis(imageUrl, prompt);
-      } else {
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ type: "text", text: message }));
-          addConsoleEntry(
-            "outgoing",
-            "User Message: " + message,
-            null,
-            "💬",
-            "user"
-          );
-        }
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "text", text: message }));
+        addConsoleEntry("outgoing", "User Message: " + message, null, "💬", "user");
       }
     },
-    [addUserMessage, addConsoleEntry, startDirectAnalysis]
+    [addUserMessage, addConsoleEntry]
   );
 
-  // ── Send image ──
+  // ── Send image (camera capture) → agent via main WebSocket ──
+  // The before_model_callback in agent.py intercepts the inline_data and
+  // rewrites it as a directive. Agent then decides whether to call a tool.
   const sendImage = useCallback(
-    (base64Data: string, imageDataUrl?: string) => {
-      // Add image to the chat messages (chronological order)
+    (base64Data: string, imageDataUrl?: string, prompt?: string) => {
       const dataUrl = imageDataUrl || `data:image/jpeg;base64,${base64Data}`;
-      addUserImageMessage(dataUrl);
+      addUserImageMessage(dataUrl, prompt);
+
+      addConsoleEntry(
+        "outgoing",
+        "Image Sent → Agent (agent will decide analysis)",
+        { mimeType: "image/jpeg", b64_len: base64Data.length },
+        "📷",
+        "user"
+      );
 
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(
@@ -701,19 +651,83 @@ export function useWebSocket({
             type: "image",
             data: base64Data,
             mimeType: "image/jpeg",
+            prompt: prompt || "",
           })
-        );
-        addConsoleEntry(
-          "outgoing",
-          "Image Sent",
-          { mimeType: "image/jpeg", size: base64Data.length },
-          "📷",
-          "user"
         );
       }
     },
     [addUserImageMessage, addConsoleEntry]
   );
+
+  // ── Send image upload (File object) → agent via main WebSocket ──
+  // Reads the file, compresses/resizes client-side to mimic Camera behavior,
+  // then sends as { type: "image", mimeType: "image/jpeg" } JSON.
+  // This ensures large uploads don't choke the WebSocket or backend.
+  const sendImageUpload = useCallback(
+    (file: File, prompt?: string) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+          // Create canvas for resizing/compression
+          const canvas = document.createElement("canvas");
+          let width = img.width;
+          let height = img.height;
+          
+          // Max dimension 1024px to keep payload reasonable (similar to camera)
+          const MAX_DIMENSION = 1024;
+          if (width > height) {
+            if (width > MAX_DIMENSION) {
+              height *= MAX_DIMENSION / width;
+              width = MAX_DIMENSION;
+            }
+          } else {
+            if (height > MAX_DIMENSION) {
+              width *= MAX_DIMENSION / height;
+              height = MAX_DIMENSION;
+            }
+          }
+          
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) return;
+          
+          ctx.drawImage(img, 0, 0, width, height);
+          
+          // Compress to JPEG 0.85
+          const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+          const base64 = dataUrl.split(",")[1];
+          const mimeType = "image/jpeg";
+
+          addUserImageMessage(dataUrl, prompt);
+
+          addConsoleEntry(
+            "outgoing",
+            `File Upload (Compressed) → Agent (${file.name})`,
+            { name: file.name, originalSize: file.size, mime: mimeType },
+            "📎",
+            "user"
+          );
+
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(
+              JSON.stringify({
+                type: "image",
+                data: base64,
+                mimeType,
+                prompt: prompt || "",
+              })
+            );
+          }
+        };
+        img.src = e.target?.result as string;
+      };
+      reader.readAsDataURL(file);
+    },
+    [addUserImageMessage, addConsoleEntry]
+  );
+
 
   // ── Send audio chunk (binary) ──
   const sendAudioChunk = useCallback((pcmData: ArrayBuffer) => {
@@ -744,6 +758,7 @@ export function useWebSocket({
     connectionStatus,
     sendTextMessage,
     sendImage,
+    sendImageUpload,
     sendAudioChunk,
     clearConsole,
   };
