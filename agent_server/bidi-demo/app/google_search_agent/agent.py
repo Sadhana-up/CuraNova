@@ -21,12 +21,14 @@ import json
 import os
 import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.tools.tool_context import ToolContext
+from google.adk.tools.base_tool import BaseTool          # ← NEW
 from google.adk.models.llm_request import LlmRequest
+from google.adk.models.llm_response import LlmResponse   # ← NEW
 from google.genai import types as genai_types
 from dotenv import load_dotenv
 
@@ -40,16 +42,22 @@ print("LOADING AGENT.PY MODULE...")
 # ──────────────────────────────────────────────────────────────
 _SIGNAL_PREFIX = "__MEDICAL_STREAM__:"
 
+# Names of tools that trigger background medical analysis.
+# After these run, the LLM's own interpretation is redundant —
+# we replace it with a static acknowledgement.
+_MEDICAL_TOOL_NAMES = {"analyze_medical_image", "analyze_medical_image_upload"}
+
+# State key used to communicate between the two new callbacks.
+_FLAG_KEY = "_medical_tool_called"
+
 def debug_log(msg: str):
     import datetime
     import sys
     try:
-        # Try to write to a file in a known absolute path to avoid CWD issues
         with open("d:\\curanova\\agent_server\\bidi-demo\\app\\google_search_agent\\debug_callback.log", "a") as f:
             f.write(f"{datetime.datetime.now()} - {msg}\n")
     except Exception as e:
         print(f"Failed to write to log file: {e}")
-    
     print(msg)
     sys.stdout.flush()
 
@@ -59,14 +67,12 @@ def log_tool_usage(tool_name: str, args: dict):
         log_path = "d:\\curanova\\agent_server\\bidi-demo\\app\\google_search_agent\\tool_usage.log"
         timestamp = datetime.datetime.now().isoformat()
         log_entry = f"[{timestamp}] Tool: {tool_name} | Args: {json.dumps(args, default=str)}\n"
-        
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(log_entry)
-            
-        # Also print to stdout for immediate feedback
         print(f"TOOL_LOG: {log_entry.strip()}")
     except Exception as e:
         print(f"Failed to log tool usage: {e}")
+
 
 # ──────────────────────────────────────────────────────────────
 # Tool 1: Trigger analysis via public image URL
@@ -91,19 +97,9 @@ def analyze_medical_image(image_url: str, prompt: str) -> str:
         client. After this call, tell the user their request is being
         processed by the medical agent.
     """
-    # Log usage
-    log_tool_usage("analyze_medical_image", {
-        "image_url": image_url,
-        "prompt": prompt
-    })
-
-    payload = {
-        "image_url": image_url,
-        "prompt": prompt,
-        "max_new_tokens": 500,
-    }
-    signal = _SIGNAL_PREFIX + json.dumps(payload)
-    return signal
+    log_tool_usage("analyze_medical_image", {"image_url": image_url, "prompt": prompt})
+    payload = {"image_url": image_url, "prompt": prompt, "max_new_tokens": 500}
+    return _SIGNAL_PREFIX + json.dumps(payload)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -131,14 +127,12 @@ def analyze_medical_image_upload(
         A signal string for the backend streaming mechanism.
     """
     debug_log(f"DEBUG: [analyze_medical_image_upload] Called with prompt='{prompt}', session_id='{session_id}'")
-    
-    # Log usage (excluding massive image data)
     log_tool_usage("analyze_medical_image_upload", {
         "prompt": prompt,
         "session_id": session_id,
         "note": "Image data retrieved from session state or fallback file"
     })
-    
+
     images_b64 = tool_context.state.get("uploaded_images_b64", [])
 
     if images_b64:
@@ -157,42 +151,119 @@ def analyze_medical_image_upload(
                         images_b64 = data
                         debug_log(f"DEBUG: [analyze_medical_image_upload] Loaded {len(images_b64)} images from fallback file.")
             else:
-                 debug_log(f"DEBUG: [analyze_medical_image_upload] Fallback file not found: {fallback_path}")
+                debug_log(f"DEBUG: [analyze_medical_image_upload] Fallback file not found: {fallback_path}")
         except Exception as e:
             debug_log(f"DEBUG: [analyze_medical_image_upload] Error reading fallback file: {e}")
 
     if not images_b64:
-        debug_log("DEBUG: [analyze_medical_image_upload] ERROR: No uploaded images found in session state or fallback file.")
+        debug_log("DEBUG: [analyze_medical_image_upload] ERROR: No uploaded images found.")
         return "ERROR: No uploaded images found. Please try uploading again."
-    
-    # Detailed logging for verification
+
     debug_log(f"DEBUG: [analyze_medical_image_upload] SUCCESS! Found {len(images_b64)} images.")
     for idx, img in enumerate(images_b64):
         img_len = len(img) if img else 0
         img_preview = img[:30] + "..." if img_len > 30 else "check data"
         debug_log(f"DEBUG: [analyze_medical_image_upload] Image {idx+1}: Length={img_len} chars | Preview={img_preview}")
 
-    payload: dict = {
-        "image_b64": images_b64[0],
-        "prompt": prompt,
-        "max_new_tokens": 500,
-    }
+    payload: dict = {"image_b64": images_b64[0], "prompt": prompt, "max_new_tokens": 500}
     if len(images_b64) > 1:
         payload["image_b64_2"] = images_b64[1]
 
-    signal = _SIGNAL_PREFIX + json.dumps(payload)
-    return signal
+    return _SIGNAL_PREFIX + json.dumps(payload)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# NEW CALLBACK 1: before_tool_callback
+#
+# Fires just before any tool runs.
+# When a medical analysis tool is about to execute, we plant a flag
+# in session state so the after_model_callback knows to intercept
+# the LLM's follow-up interpretation.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def before_tool_callback(
+    tool: BaseTool,
+    args: Dict[str, Any],
+    tool_context: ToolContext,
+) -> Optional[Dict]:
+    """
+    Intercept point: fires before every tool call.
+
+    For medical analysis tools, we set a state flag so the
+    after_model_callback can replace the LLM's redundant text
+    interpretation with a single static acknowledgement line.
+
+    Returns None always — we never want to skip the tool itself here,
+    because main.py needs the signal string the tool returns.
+    """
+    tool_name = tool.name
+    if tool_name in _MEDICAL_TOOL_NAMES:
+        debug_log(f"[before_tool_callback] Medical tool '{tool_name}' is about to run — setting flag.")
+        tool_context.state[_FLAG_KEY] = True
+    return None  # Always let the tool execute normally
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# NEW CALLBACK 2: after_model_callback_handler
+#
+# Fires after every LLM generation.
+# When the flag is present AND the LLM just produced a plain text
+# response (i.e. its interpretation of the tool result), we replace
+# that text with a single static acknowledgement and clear the flag.
+#
+# We leave function_call responses untouched — those are the LLM
+# deciding TO call a tool, which is fine and needed.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def after_model_callback_handler(
+    callback_context: CallbackContext,
+    llm_response: LlmResponse,
+) -> Optional[LlmResponse]:
+    """
+    Intercept point: fires after every LLM generation.
+
+    If a medical tool was just called (flag is set) and the LLM has now
+    produced a plain text response (its interpretation of the tool result),
+    replace that response with a concise static acknowledgement.
+
+    Function-call responses are left untouched so the tool still executes.
+    """
+    if not callback_context.state.get(_FLAG_KEY):
+        return None  # Not a medical tool turn — do nothing
+
+    content = llm_response.content
+    if not content or not content.parts:
+        return None
+
+    parts = content.parts
+
+    has_function_call = any(getattr(p, "function_call", None) for p in parts)
+    has_text          = any(getattr(p, "text", None) for p in parts)
+
+    if has_function_call:
+        # This is the LLM deciding to call the tool — let it through untouched.
+        debug_log("[after_model_callback] Function call response — not intercepting.")
+        return None
+
+    if has_text:
+        # This is the LLM's interpretation AFTER the tool ran — replace it.
+        debug_log("[after_model_callback] Replacing LLM interpretation with static acknowledgement.")
+        callback_context.state[_FLAG_KEY] = False  # Clear flag
+
+        return LlmResponse(
+            content=genai_types.Content(
+                role="model",
+                parts=[genai_types.Part(
+                    text="Your request is being processed by our medical imaging agent. "
+                         "The analysis will appear momentarily ✨"
+                )],
+            )
+        )
+
+    return None
 
 
 # ──────────────────────────────────────────────────────────────
 # Before-model callback — intercept uploaded images
-#
-# When the client sends `{ type: "image", data: "<b64>" }` through the
-# bidi stream, main.py wraps it as inline_data on a Content object and
-# places it in the LiveRequestQueue. This callback intercepts that Content
-# before Gemini sees it, extracts the base64 bytes, stores them in
-# callback_context.state, and rewrites the user message as a text-only
-# directive so Gemini can decide whether a medical analysis is needed.
+# (unchanged from original)
 # ──────────────────────────────────────────────────────────────
 async def before_model_callback(
     callback_context: CallbackContext,
@@ -204,7 +275,6 @@ async def before_model_callback(
     NOTE: As of Feb 2026, image processing has moved to main.py for reliability.
     This callback is kept as a fallback or for debugging purposes.
     """
-
     debug_log("DEBUG: [before_model_callback] ENTERED")
     try:
         if not llm_request.contents:
@@ -212,8 +282,7 @@ async def before_model_callback(
             return None
 
         debug_log(f"DEBUG: [before_model_callback] Contents count: {len(llm_request.contents)}")
-        
-        # Find the last user turn
+
         last_user_content = None
         if llm_request.contents:
             for content in reversed(llm_request.contents):
@@ -222,131 +291,75 @@ async def before_model_callback(
                 if role == "user":
                     last_user_content = content
                     break
-        
+
         if not last_user_content:
             debug_log("DEBUG: [before_model_callback] No user content found in llm_request.")
-            # Fallback: check if there are any contents at all, maybe the role is missing or different?
             if llm_request.contents:
-                 debug_log(f"DEBUG: [before_model_callback] Contents available: {len(llm_request.contents)}")
-                 # potentially use the last content if it's the only one and we just sent it?
-                 # Check if the last content has no role (sometimes it happens?) or 'model' role but it's actually ours?
-                 # Just picking the last content to inspect parts:
-                 last_user_content = llm_request.contents[-1]
-                 debug_log(f"DEBUG: [before_model_callback] Inspecting last content (role={getattr(last_user_content, 'role', 'unknown')})")
+                debug_log(f"DEBUG: [before_model_callback] Contents available: {len(llm_request.contents)}")
+                last_user_content = llm_request.contents[-1]
+                debug_log(f"DEBUG: [before_model_callback] Inspecting last content (role={getattr(last_user_content, 'role', 'unknown')})")
             else:
-                 return None
+                return None
 
         parts = getattr(last_user_content, "parts", []) or []
         images_b64: list[str] = []
         text_parts: list[str] = []
 
         debug_log(f"DEBUG: [before_model_callback] Processing {len(parts)} parts")
-        # print(f"DEBUG: [before_model_callback] Current state keys: {list(callback_context.state.keys())}")  # 'State' object has no attribute 'keys'
 
         for i, part in enumerate(parts):
             debug_log(f"DEBUG: [before_model_callback] Inspecting part {i}")
-            # Check both snake_case and camelCase attributes
-            # Also check deeper structure if part is a dict (which it shouldn't be, but let's be safe)
             inline = getattr(part, "inline_data", None) or getattr(part, "inlineData", None)
-            
+
             if not inline:
-                # Check if part itself is a dict-like object or has other attributes
-                # Sometimes wrapping might be weird
                 debug_log(f"DEBUG: [before_model_callback] Part {i} has no direct inline_data attribute")
                 if hasattr(part, "to_dict"):
                     d = part.to_dict()
                     debug_log(f"DEBUG: [before_model_callback] Part {i} as dict keys: {d.keys()}")
                     if "inline_data" in d:
-                         # Try to construct it or use it? But we need bytes
-                         debug_log(f"DEBUG: [before_model_callback] Found inline_data in dict, likely a serialization issue if getattr failed")
+                        debug_log(f"DEBUG: [before_model_callback] Found inline_data in dict, likely a serialization issue if getattr failed")
 
             if inline:
                 mime_type = getattr(inline, "mime_type", "") or getattr(inline, "mimeType", "")
-                if not mime_type and hasattr(inline, "mime_type"): # Sometimes empty string
-                     mime_type = inline.mime_type
-                
+                if not mime_type and hasattr(inline, "mime_type"):
+                    mime_type = inline.mime_type
+
                 debug_log(f"DEBUG: [before_model_callback] Found inline data with mime_type: {mime_type}")
-                
+
                 if mime_type.startswith("image/"):
                     raw = getattr(inline, "data", b"")
-                    # Ensure data is bytes-like
                     if isinstance(raw, (bytes, bytearray)):
                         b64_str = base64.b64encode(raw).decode("utf-8")
                         images_b64.append(b64_str)
                         debug_log(f"DEBUG: [before_model_callback] Encoded image (len={len(b64_str)})")
                     elif isinstance(raw, str):
-                        # If data is already string (base64 possibly?), try to decode then encode or treat as base64
-                        # Assuming it's base64 string if it's string type here
                         images_b64.append(raw)
                         debug_log(f"DEBUG: [before_model_callback] Found string image data (len={len(raw)})")
-            
-            # Check for text content
+
             text_content = getattr(part, "text", "")
             if text_content:
                 text_parts.append(text_content)
 
         if not images_b64:
             debug_log(f"DEBUG: [before_model_callback] No images found in parts (Total parts: {len(parts)})")
-            return None  # No images — let the model proceed normally
-        
+            return None
+
         debug_log(f"DEBUG: [before_model_callback] Found {len(images_b64)} images. Storing in state...")
-
-        # Enforce max-2 limit
         images_b64 = images_b64[:2]
-
         prompt = " ".join(text_parts).strip()
 
-        # Check for directive prefix to avoid double-processing (since main.py injects directive)
-        # If the 'prompt' starts with "The user sent...", it's likely our own directive coming back around?
-        # No, before_model_callback processes what is ABOUT to go to the model.
-        # If main.py sends types.Content(parts=[text, image]), this callback will see it.
-        
-        # KEY CHANGE: Do NOT strip the image from the message if we want the model to see it!
-        # The previous logic was explicitly replacing the parts with JUST text directive.
-        # We need to allow the image to pass through so the model can see it for "NO" cases.
-        
-        # Store base64 data in session state for the agent to reference (still needed for tool call)
         callback_context.state["uploaded_images_b64"] = images_b64
         callback_context.state["uploaded_image_count"] = len(images_b64)
         callback_context.state["upload_prompt"] = prompt
-        
+
         debug_log(f"DEBUG: [before_model_callback] State updated with {len(images_b64)} images.")
 
-        # If this is coming from main.py's manual injection, the text part is already the directive.
-        # We should detect if the text part ALREADY contains our directive signature.
         if "Decide: does this image require a CLINICAL / MEDICAL analysis?" in prompt:
-             debug_log("DEBUG: [before_model_callback] Detected existing directive. Letting it pass through with image.")
-             return None # Let the model see the image and the directive!
+            debug_log("DEBUG: [before_model_callback] Detected existing directive. Letting it pass through with image.")
+            return None
 
-        # ... (Old logic for patching user message if we were intercepting raw uploads, but main.py handles that now)
-        # In fact, since main.py is now doing the heavy lifting, this callback might be redundant or conflicting
-        # if it tries to rewrite the message again.
-        
         return None
-        
-        debug_log(f"DEBUG: [before_model_callback] State updated with {len(images_b64)} images.")
 
-
-        # Build indexes into state for the tool-call directive
-        image_count = len(images_b64)
-        
-        # We REMOVE the patching logic here because we want the image to pass through to the model
-        # so it can describe it visually if no tool is called.
-        # The directive from main.py is already structured as Text + Image.
-        
-        if "Decide: does this image require a CLINICAL / MEDICAL analysis?" in prompt:
-             debug_log("DEBUG: [before_model_callback] Skipped patching (main.py directive detected)")
-             return None 
-        
-        # If this is a raw client upload not processed by main.py (unlikely now), we might patch it.
-        # But generally, we should just let the image through.
-        
-        debug_log(f"DEBUG: [before_model_callback] Pass-through: Allowing model to see {image_count} images directly.")
-
-        # Store actual b64 values so the model can access them mid-prompt
-        # (Gemini will see the directive text and must read from state for full data)
-        return None  # Proceed to LLM with patched request
-        
     except Exception as e:
         import traceback
         debug_log(f"ERROR inside before_model_callback: {e}")
@@ -360,7 +373,11 @@ async def before_model_callback(
 agent = Agent(
     name="CuraNovaMedicalAgent",
     model=os.getenv("DEMO_AGENT_MODEL", "gemini-2.0-flash-exp"),
+    # ── Callbacks ───────────────────────────────────────────
     before_model_callback=before_model_callback,
+    before_tool_callback=before_tool_callback,           # ← NEW
+    after_model_callback=after_model_callback_handler,   # ← NEW
+    # ────────────────────────────────────────────────────────
     instruction="""You are CuraNova, a specialized medical AI assistant with deep expertise in medical imaging and clinical knowledge.
 
 You have full memory of the conversation. Always use previous context when answering.
