@@ -86,7 +86,14 @@ async def analyze_proxy(websocket: WebSocket) -> None:
         logger.info(f"[analyze_proxy] Received request data: {request_data[:200]}")
         request = json.loads(request_data)
 
-        prompt         = request.get("prompt", "Describe this medical image in detail.")
+        # Allow empty or custom prompts; only fallback if key is missing entirely.
+        prompt         = request.get("prompt", "")
+        if not prompt:
+            # Only if truly empty/None, consider a sensible default OR just leave it empty.
+            # User requested removal of automatic "Describe this image" prompt.
+            # We will use an empty string or whatever the client sent.
+            prompt = "" 
+            
         max_new_tokens = request.get("max_new_tokens", 500)
         image_url      = request.get("image_url", "")
         image_url_2    = request.get("image_url_2", "")
@@ -418,7 +425,7 @@ async def websocket_endpoint(
         app_name=APP_NAME, user_id=user_id, session_id=session_id
     )
     if not session:
-        await session_service.create_session(
+        session = await session_service.create_session(
             app_name=APP_NAME, user_id=user_id, session_id=session_id
         )
 
@@ -449,28 +456,146 @@ async def websocket_endpoint(
                     logger.debug(f"Sent text to agent: {json_message['text'][:80]}")
 
                 elif json_message.get("type") == "image":
-                    # Uploaded image — wrap as inline_data so before_model_callback
-                    # can intercept it and the agent can decide whether to analyze it
-                    image_data = base64.b64decode(json_message["data"])
-                    mime_type = json_message.get("mimeType", "image/jpeg")
+                    # ──────────────────────────────────────────────────────────
+                    # MANUAL MANIPULATION (Bypassing before_model_callback)
+                    # ──────────────────────────────────────────────────────────
+                    # Since the callback isn't firing reliably in streaming mode,
+                    # we manually inject the image into the session state here
+                    # and rewrite the message as a text directive.
+                    # ──────────────────────────────────────────────────────────
+                    
+                    image_b64 = json_message["data"]
+                    # If prompt is empty, let it be empty. Do not force "Describe this image."
                     prompt_text = json_message.get("prompt", "")
+                    logger.info(f"[IMAGE UPLOAD] Received image (len={len(image_b64)}). Manually storing in session state.")
+                    
+                    # Log first 50 chars of base64 to check for validity/prefix
+                    logger.info(f"[IMAGE UPLOAD] Base64 start: {image_b64[:50]}")
 
-                    parts = [
-                        types.Part(
+                    # update session state
+                    if session:
+                        # Append to existing images or start new list
+                        current_images = session.state.get("uploaded_images_b64", [])
+                        if not isinstance(current_images, list):
+                            current_images = []
+                        
+                        current_images.append(image_b64)
+                        # Keep max 2
+                        current_images = current_images[-2:]
+                        
+                        session.state["uploaded_images_b64"] = current_images
+                        session.state["uploaded_image_count"] = len(current_images)
+                        session.state["upload_prompt"] = prompt_text
+                        logger.info(f"[IMAGE UPLOAD] Session state updated. Total images: {len(current_images)}")
+                        
+                        # ──────────────────────────────────────────────────────
+                        # Fallback: Save to file system for reliability
+                        # ──────────────────────────────────────────────────────
+                        try:
+                            # Ensure directory exists (with explicit Windows path handling if needed)
+                            fallback_dir = Path("d:/curanova/uploaded_images")
+                            fallback_dir.mkdir(parents=True, exist_ok=True)
+                            
+                            fallback_path = fallback_dir / f"{session_id}.json"
+                            
+                            # Read existing if any
+                            existing_data = []
+                            if fallback_path.exists():
+                                try:
+                                    with open(fallback_path, "r", encoding="utf-8") as f:
+                                        existing_data = json.load(f)
+                                except Exception:
+                                    pass
+                            
+                            if not isinstance(existing_data, list):
+                                existing_data = []
+                                
+                            existing_data.append(image_b64)
+                            # Keep max 2
+                            existing_data = existing_data[-2:]
+                            
+                            # Ensure the file is written completely
+                            with open(fallback_path, "w", encoding="utf-8") as f:
+                                json.dump(existing_data, f)
+                                f.flush()
+                                os.fsync(f.fileno())
+                                
+                            logger.info(f"[IMAGE UPLOAD] Saved to fallback file: {fallback_path}")
+                        except Exception as e:
+                            logger.error(f"[IMAGE UPLOAD] Failed to save fallback file: {e}")
+
+                    else:
+                        logger.error("[IMAGE UPLOAD] Session object is None! Cannot store image.")
+
+                    # Construct directive for the agent
+                    # Ensure we use session state for count
+                    count = len(session.state.get("uploaded_images_b64", [])) if session and session.state else 1
+                    
+                    # We inject the image data directly into the tool call instructions just in case state persistence fails
+                    # We'll use a unique variable name to avoid confusion
+                    img_data_snippet = image_b64[:20] + "..." + image_b64[-20:]
+                    logger.info(f"DEBUG: Constructing directive with image snippet: {img_data_snippet}")
+
+                    directive = (
+                        f"The user sent {count} image(s) with this message: \"{prompt_text}\"\n"
+                        f"I have manually injected the image data into your session state under key 'uploaded_images_b64'.\n"
+                        f"I have ALSO saved a backup of the image(s) to a file associated with session_id='{session_id}'.\n"
+                        
+                        f"\nDecide: does this image require a CLINICAL / MEDICAL analysis?\n"
+                        f"- If YES → call analyze_medical_image_upload(prompt=\"{prompt_text}\", session_id=\"{session_id}\").\n"
+                        f"  (The tool will automatically retrieve images from session state or the fallback file).\n"
+                        f"- If NO  → describe the image(s) using your own vision capability and answer normally.\n"
+                        f"\nIMPORTANT: Do not try to access state['uploaded_images_b64'] yourself."
+                    )
+
+                    # Send as MULTIMODAL content (Text + Image) so the agent can SEE it
+                    # We send both the text directive AND the image bytes in the same turn.
+                    # This allows the model to "see" the image for general description,
+                    # while the directive guides it on whether to use the medical tool.
+                    
+                    # LOGGING FOR DEBUGGING
+                    logger.info(f"DEBUG: Injecting directive + image for upload. Prompt: {prompt_text}")
+                    logger.info(f"DEBUG: Session state keys now: {list(session.state.keys()) if session else 'NO SESSION'}")
+
+                    try:
+                        # Create the image part
+                        image_bytes = base64.b64decode(image_b64)
+                        image_part = types.Part(
                             inline_data=types.Blob(
-                                mime_type=mime_type,
-                                data=image_data,
+                                mime_type="image/jpeg",  # Assuming jpeg from client
+                                data=image_bytes
                             )
                         )
-                    ]
-                    if prompt_text:
-                        parts.append(types.Part(text=prompt_text))
+                        
+                        # Create the text directive part
+                        text_part = types.Part(text=directive)
+                        
+                        # content = types.Content(parts=[types.Part(text=directive)]) -- OLD
+                        content = types.Content(parts=[text_part, image_part])
+                        
+                        # The ADK runner processes items from live_request_queue.
+                        # send_content sends a Content object.
+                        live_request_queue.send_content(content)
+                        logger.info(f"DEBUG: Directive + Image sent to live_request_queue successfully.")
+                    except Exception as e:
+                        logger.error(f"DEBUG: Failed to send directive/image to queue: {e}")
+                    logger.info(f"DEBUG: Session state keys now: {list(session.state.keys()) if session else 'NO SESSION'}")
+                    if session and "uploaded_images_b64" in session.state:
+                         imgs = session.state["uploaded_images_b64"]
+                         logger.info(f"DEBUG: stored image count: {len(imgs)}")
+                         if len(imgs) > 0:
+                              logger.info(f"DEBUG: First image b64 len: {len(imgs[0])}")
 
-                    content = types.Content(parts=parts)
-                    live_request_queue.send_content(content)
-                    logger.debug(
-                        f"Sent image to agent: {len(image_data)} bytes, type={mime_type}"
-                    )
+                    try:
+                        content = types.Content(parts=[types.Part(text=directive)])
+                        # The ADK runner processes items from live_request_queue.
+                        # send_content sends a Content object.
+                        # live_request_queue.send_content(content) -- This was the old one, we replaced it above
+                        pass
+                        logger.info(f"DEBUG: Directive sent to live_request_queue successfully (stub).")
+                    except Exception as e:
+                        logger.error(f"DEBUG: Failed to send directive to queue: {e}")
+
 
     # ── Downstream: agent → client ────────────────────────────────────────────
     async def downstream_task() -> None:
@@ -545,7 +670,9 @@ async def websocket_endpoint(
                     await websocket.send_json({"error": "Agent connection error"})
                 except:
                     pass
-
+        
+        # When downstream finishes, close the queue to release the upstream
+        live_request_queue.close()
         logger.debug("run_live() generator completed")
 
 

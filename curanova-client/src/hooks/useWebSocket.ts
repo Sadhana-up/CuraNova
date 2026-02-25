@@ -126,10 +126,10 @@ export function useWebSocket({
     ]);
   }, []);
 
-  const addUserImageMessage = useCallback((imageDataUrl: string) => {
+  const addUserImageMessage = useCallback((imageDataUrl: string, prompt?: string) => {
     setMessages((prev) => [
       ...prev,
-      { id: randomId(), type: "image", text: "", imageDataUrl },
+      { id: randomId(), type: "image", text: prompt || "", imageDataUrl },
     ]);
   }, []);
 
@@ -635,7 +635,7 @@ export function useWebSocket({
   const sendImage = useCallback(
     (base64Data: string, imageDataUrl?: string, prompt?: string) => {
       const dataUrl = imageDataUrl || `data:image/jpeg;base64,${base64Data}`;
-      addUserImageMessage(dataUrl);
+      addUserImageMessage(dataUrl, prompt);
 
       addConsoleEntry(
         "outgoing",
@@ -660,42 +660,74 @@ export function useWebSocket({
   );
 
   // ── Send image upload (File object) → agent via main WebSocket ──
-  // Reads the file, converts to base64, sends as { type: "image" } JSON.
-  // Agent's before_model_callback intercepts inline_data and decides.
+  // Reads the file, compresses/resizes client-side to mimic Camera behavior,
+  // then sends as { type: "image", mimeType: "image/jpeg" } JSON.
+  // This ensures large uploads don't choke the WebSocket or backend.
   const sendImageUpload = useCallback(
     (file: File, prompt?: string) => {
       const reader = new FileReader();
-      reader.onloadend = () => {
-        const result = reader.result as string;
-        const base64 = result.split(",")[1];
-        const mimeType = result.split(";")[0].replace("data:", "") || "image/jpeg";
-        const dataUrl = result;
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+          // Create canvas for resizing/compression
+          const canvas = document.createElement("canvas");
+          let width = img.width;
+          let height = img.height;
+          
+          // Max dimension 1024px to keep payload reasonable (similar to camera)
+          const MAX_DIMENSION = 1024;
+          if (width > height) {
+            if (width > MAX_DIMENSION) {
+              height *= MAX_DIMENSION / width;
+              width = MAX_DIMENSION;
+            }
+          } else {
+            if (height > MAX_DIMENSION) {
+              width *= MAX_DIMENSION / height;
+              height = MAX_DIMENSION;
+            }
+          }
+          
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) return;
+          
+          ctx.drawImage(img, 0, 0, width, height);
+          
+          // Compress to JPEG 0.85
+          const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+          const base64 = dataUrl.split(",")[1];
+          const mimeType = "image/jpeg";
 
-        addUserImageMessage(dataUrl);
+          addUserImageMessage(dataUrl, prompt);
 
-        addConsoleEntry(
-          "outgoing",
-          `File Upload → Agent (${file.name})`,
-          { name: file.name, size: file.size, mime: mimeType },
-          "📎",
-          "user"
-        );
-
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(
-            JSON.stringify({
-              type: "image",
-              data: base64,
-              mimeType,
-              prompt: prompt || "",
-            })
+          addConsoleEntry(
+            "outgoing",
+            `File Upload (Compressed) → Agent (${file.name})`,
+            { name: file.name, originalSize: file.size, mime: mimeType },
+            "📎",
+            "user"
           );
-        }
+
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(
+              JSON.stringify({
+                type: "image",
+                data: base64,
+                mimeType,
+                prompt: prompt || "",
+              })
+            );
+          }
+        };
+        img.src = e.target?.result as string;
       };
       reader.readAsDataURL(file);
     },
     [addUserImageMessage, addConsoleEntry]
   );
+
 
   // ── Send audio chunk (binary) ──
   const sendAudioChunk = useCallback((pcmData: ArrayBuffer) => {

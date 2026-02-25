@@ -101,7 +101,7 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
       <motion.div
         initial={{ opacity: 0, scale: 0.95 }}
         animate={{ opacity: 1, scale: 1 }}
-        className="flex justify-end"
+        className="flex flex-col items-end gap-2"
       >
         <div className="max-w-[280px] rounded-2xl overflow-hidden ring-1 ring-white/[0.08]">
           {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -111,6 +111,13 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
             className="w-full h-auto object-cover"
           />
         </div>
+        {msg.text && (
+          <div className="max-w-[75%] px-4 py-2.5 rounded-2xl bg-violet-500/90 text-white rounded-tr-md">
+            <p className="text-[13.5px] leading-relaxed whitespace-pre-wrap break-words">
+              {msg.text}
+            </p>
+          </div>
+        )}
       </motion.div>
     );
   }
