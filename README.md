@@ -62,8 +62,7 @@ A multimodal, bidirectional medical assistant system that integrates specialized
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/your-username/medical-ai-agent.git
-cd medical-ai-agent
+https://github.com/Sadhana-up/CuraNova.git
 ```
 
 ---
